@@ -348,8 +348,13 @@ def run(until, send, opening=True, stop=None):
             except Exception:
                 pass
             last_mkt = time.time()
-        t = focus[(i // 2) % len(focus)]
-        use_bse = i % 2 == 1 and ex.bse_code and t.replace(".NS", "") in ex.isin
+        # NSE and BSE work through the list half a cycle apart, so each stock gets a fresh price twice per cycle
+        n, k = len(focus), i // 2
+        if i % 2 == 1 and ex.bse_code:
+            t = focus[(k + n // 2) % n]
+            use_bse = t.replace(".NS", "") in ex.isin
+        else:
+            t, use_bse = focus[k % n], False
         i += 1
         sym = t.replace(".NS", "")
         try:

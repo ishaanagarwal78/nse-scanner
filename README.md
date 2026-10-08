@@ -19,7 +19,7 @@ and TradingView's public stream marks NSE as `delayed_streaming_900`. The exchan
 so the scanner builds its feed from them:
 
 - **Alerts** use NSE's quote API (price, volume, best buyer and seller) alternating with BSE's, for stocks in their
-  unlock week and stocks on someone's watchlist. Each exchange gets about 10 requests a minute.
+  unlock week and stocks on someone's watchlist. Each exchange gets about 10 requests a minute, so with 10 stocks each one gets a fresh price about every 30 seconds.
   Alerts fire on falls of 5% and 10%, rises of 5% and 10% (watchlist only), a 3% move within 10 minutes,
   and volume running at 3x the usual pace.
 - **Minute bars** for every recent IPO come from Yahoo's public websocket, decoded by our own code. A delay does
