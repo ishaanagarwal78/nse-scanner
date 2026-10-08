@@ -62,8 +62,13 @@ def classify(desc, text):
         return ("Insolvency update", "low", "negative")
     if d == "Change in Auditors" and re.search(r"resign", low):
         return ("Auditor resigned", "high", "negative")
-    if re.search(r"\bbuy[- ]?back\b", low) and re.search(r"approv|consider|board", low):
-        return ("Buyback", "high", "positive")
+    if re.search(r"\bbuy[- ]?back\b", (d + " " + t).lower()):
+        both = (d + " " + t).lower()
+        if re.search(r"post[- ]?buy|closure|complet|extinguish|outcome of buy|corrigendum|dispatch|daily report", both):
+            return ("Buyback (process step)", "low", "neutral")
+        if re.search(r"public announcement|letter of offer|approv|consider|board", both):
+            return ("Buyback", "high", "positive")
+        return ("Buyback update", "medium", "positive")
     if re.search(r"\bbonus\b", low) and re.search(r"issue|share|approv|recommend", low):
         return ("Bonus shares", "high", "positive")
     if re.search(r"\bopen offer\b", low) or (d == "Disclosure under SEBI Takeover Regulations" and "offer" in low):
