@@ -51,3 +51,10 @@ jobs:
           else
             python -m scanner.run --backfill "${{ github.event.inputs.date || '2026-10-08' }}"
           fi
+      - name: Keep the day's price data
+        if: always() && hashFiles('stream_data/*.csv') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: prices-${{ github.run_id }}
+          path: stream_data/
+          retention-days: 90

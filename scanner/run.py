@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -156,7 +157,15 @@ def chats():
     return [c for c in r.json().get("chats", []) if (c.get("prefs") or {}).get("news", True)]
 
 
+SEND_LOCK = threading.Lock()
+
+
 def send(chat_id, msg):
+    with SEND_LOCK:
+        _send(chat_id, msg)
+
+
+def _send(chat_id, msg):
     if not LIVE:
         print(f"[dry run -> {chat_id}]\n{msg['text']}\n")
         return
@@ -222,6 +231,10 @@ def session(until, opening=True, catchup_minutes=10):
     nse = NSE()
     people = chats()
     print(f"{len(people)} chats; live={LIVE}; until {until} IST")
+    # Live prices run alongside in their own thread (exchange quotes for alerts, Yahoo stream for minute bars)
+    from . import stream
+    feed = threading.Thread(target=stream.run, args=(until, send, opening), daemon=True)
+    feed.start()
     seen, pending, sent_keys = set(), [], set()
     now = datetime.now(IST)
     # Overnight and pre-market filings since yesterday's close: one opening digest, no individual pings
@@ -278,6 +291,7 @@ def session(until, opening=True, catchup_minutes=10):
             except Exception:
                 pass
         time.sleep(POLL_SECONDS)
+    feed.join(timeout=60)
     print("session finished")
 
 

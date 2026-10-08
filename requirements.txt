@@ -1,3 +1,4 @@
 curl_cffi>=0.7
 requests>=2.31
 openpyxl>=3.1
+websockets>=13
