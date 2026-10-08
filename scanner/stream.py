@@ -1,15 +1,14 @@
 """Our own live price feed, built from free public sources, no broker and no paid API.
 
-Two jobs, two kinds of source:
+1. NSE's own push stream (the one its quote pages use): one connection per followed stock (unlock week and
+   watchlists). Each message has the last price, volume and the order book. This drives the price alerts.
+2. Polling NSE's and BSE's quote APIs, for any followed stock the stream has not updated in 45 seconds.
+3. Order flow: successive NSE quotes are turned into buyer-initiated versus seller-initiated volume per minute,
+   plus the shares waiting to buy and sell. Saved every day as our own order-flow history.
+4. Pre-open (9:00-9:08): NSE's pre-open book for every stock, saved, with alerts on strong imbalances.
+5. Yahoo's public websocket for 1-minute bars of every recent IPO (Yahoo marks NSE as delayed; fine for history).
 
-1. Alerts need fresh prices. The exchanges' own websites are not delayed, so the poller asks NSE's quote API
-   and BSE's quote API in turn for the stocks that matter today (unlock week + watchlists). Each exchange
-   gets about 10 requests a minute, so with 10 stocks each one is refreshed about every 30 seconds.
-2. Research needs complete minute-by-minute history. Yahoo's public websocket pushes every price change for
-   all recent IPOs; we decode it ourselves and build 1-minute bars. Yahoo labels NSE data as 15 minutes
-   delayed, which does not matter for history, and the lag report measures the real delay of every source.
-
-Started from run.session() in a background thread. Alerts stay dry-run unless ALERTS_LIVE=1.
+Started from run.session() in a background thread. Price alerts are sent only when PRICE_ALERTS_LIVE=1.
 """
 import asyncio
 import base64
@@ -215,7 +214,8 @@ class Exchanges:
             ex_time = None
         return {"source": "NSE", "price": float(p), "chg": 100 * (float(p) / float(prev) - 1),
                 "volume": ti.get("totalTradedVolume"), "bid": ob.get("buyPrice1") or None,
-                "ask": ob.get("sellPrice1") or None, "time": ex_time, "name": md.get("companyName")}
+                "ask": ob.get("sellPrice1") or None, "time": ex_time, "name": md.get("companyName"),
+                "depth": parse_book(ob)}
 
     def load_bse_codes(self):
         """ISIN -> BSE scrip code from one bulk list, so per-stock BSE requests need no lookups."""
@@ -310,37 +310,298 @@ def clean(s):
     return re.sub(r"\s+(Ltd\.?|Limited)$", "", str(s or ""), flags=re.I)
 
 
+# ---------- order books and NSE's own push stream ----------
+def parse_time(x):
+    if x in (None, "", 0):
+        return None
+    if isinstance(x, (int, float)):
+        return datetime.fromtimestamp(x / 1000 if x > 1e11 else x, IST)
+    for f in ("%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%Y-%m-%dT%H:%M:%S", "%d-%m-%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(str(x)[:20].strip(), f).replace(tzinfo=IST)
+        except Exception:
+            pass
+    return None
+
+
+def parse_book(ob):
+    """Order book in any of NSE's shapes -> {bids: [(price, qty)], asks: [...], tot_buy, tot_sell} or None."""
+    if not ob:
+        return None
+    bids, asks, tb, ts = [], [], None, None
+    if isinstance(ob, dict):
+        for i in range(1, 6):
+            bp, bq = ob.get(f"buyPrice{i}"), ob.get(f"buyQuantity{i}")
+            sp, sq = ob.get(f"sellPrice{i}"), ob.get(f"sellQuantity{i}")
+            if bp:
+                bids.append((float(bp), float(bq or 0)))
+            if sp:
+                asks.append((float(sp), float(sq or 0)))
+        for k in ("bids", "buy", "bid"):
+            for x in ob.get(k) or []:
+                if isinstance(x, dict) and x.get("price"):
+                    bids.append((float(x["price"]), float(x.get("quantity") or x.get("qty") or 0)))
+        for k in ("asks", "sell", "ask", "offers"):
+            for x in ob.get(k) or []:
+                if isinstance(x, dict) and x.get("price"):
+                    asks.append((float(x["price"]), float(x.get("quantity") or x.get("qty") or 0)))
+        tb, ts = ob.get("totalBuyQuantity") or ob.get("totBuyQty"), ob.get("totalSellQuantity") or ob.get("totSellQty")
+    elif isinstance(ob, list):
+        for x in ob:
+            if isinstance(x, dict) and x.get("price"):
+                if x.get("buyQuantity"):
+                    bids.append((float(x["price"]), float(x["buyQuantity"])))
+                if x.get("sellQuantity"):
+                    asks.append((float(x["price"]), float(x["sellQuantity"])))
+        bids.sort(reverse=True)
+        asks.sort()
+    if not (bids or asks or tb or ts):
+        return None
+    return {"bids": bids[:5], "asks": asks[:5], "tot_buy": float(tb) if tb else None, "tot_sell": float(ts) if ts else None}
+
+
+def from_stream(m):
+    """One NSE stream message -> quote dict (None for heartbeats and closed-market messages)."""
+    if not isinstance(m, dict) or m.get("symbol") in (None, "HEARTBEAT") or not m.get("ltp"):
+        return None
+    if (m.get("mktStatus") or "").upper() == "CLOSE":
+        return None
+    p = float(m["ltp"])
+    chg = m.get("pchange")
+    if chg in (None, 0) and m.get("change") not in (None, 0):
+        prev = p - float(m["change"])
+        chg = 100 * float(m["change"]) / prev if prev else None
+    depth = parse_book(m.get("orderBook"))
+    return {"source": "NSE stream", "price": p, "chg": float(chg) if chg is not None else None,
+            "volume": m.get("volume"), "bid": depth["bids"][0][0] if depth and depth["bids"] else None,
+            "ask": depth["asks"][0][0] if depth and depth["asks"] else None,
+            "time": parse_time(m.get("timestamp")), "sent": parse_time(m.get("dessiminationTime")),
+            "depth": depth, "name": None}
+
+
+STREAM_URL = "wss://streamer.nseindia.com/streams/equity/high/equityStockBySymbol?symbol={}"
+CAS_URL = "wss://streamer.nseindia.com/streams/cm/cas"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+
+
+async def nse_streams(symbols, out_q, stop, stats, cookies, samples):
+    """One NSE push connection per followed stock, plus the closing-auction stream (recorded to learn its format)."""
+    import websockets
+
+    async def one(url, key):
+        wait = 2
+        while not stop.is_set():
+            try:
+                async with websockets.connect(url, open_timeout=20, max_size=None, ping_interval=20, user_agent_header=UA,
+                                              additional_headers={"Origin": "https://www.nseindia.com", "Cookie": cookies()}) as ws:
+                    wait = 2
+                    stats["connected"].add(key)
+                    while not stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), 5)
+                        except asyncio.TimeoutError:
+                            continue
+                        stats["msgs"] += 1
+                        try:
+                            m = json.loads(raw)
+                        except Exception:
+                            continue
+                        beat = isinstance(m, dict) and "HEARTBEAT" in (m.get("symbol"), m.get("indexName"))
+                        if not beat:
+                            stats["data"] += 1
+                            if samples.get(key, 0) < 40:
+                                samples[key] = samples.get(key, 0) + 1
+                                stats["samples"].append({"stream": key, "at": datetime.now(IST).strftime("%H:%M:%S"), "msg": m})
+                                if samples[key] <= 2:
+                                    print(f"NSE stream sample [{key}]:", json.dumps(m)[:700], flush=True)
+                        if key != "cas":
+                            q = from_stream(m)
+                            if q:
+                                out_q.put((key, q))
+            except Exception as e:
+                stats["connected"].discard(key)
+                if stop.is_set():
+                    break
+                stats["drops"] += 1
+                if stats["drops"] <= 5:
+                    print(f"NSE stream {key} dropped ({type(e).__name__}: {str(e)[:80]}); retrying in {wait}s", flush=True)
+                await asyncio.sleep(wait)
+                wait = min(wait * 2, 120)
+
+    await asyncio.gather(*(one(STREAM_URL.format(s), s) for s in symbols), one(CAS_URL, "cas"))
+
+
+class Flow:
+    """Turns successive NSE quotes into order flow: who was in a hurry, buyers or sellers, minute by minute."""
+
+    def __init__(self):
+        self.prev, self.minutes, self.depth_rows = {}, {}, []
+
+    def update(self, t, q, now):
+        vol, price, d = q.get("volume"), q["price"], q.get("depth")
+        m = self.minutes.setdefault((t, now.strftime("%H:%M")), [0.0, 0.0, 0.0, 0, None, None, price])
+        m[3] += 1
+        m[6] = price
+        bid, ask = q.get("bid"), q.get("ask")
+        if d:
+            m[4], m[5] = d.get("tot_buy"), d.get("tot_sell")
+            if len(self.depth_rows) < 600000:
+                b = (d["bids"] + [(None, None)] * 5)[:5]
+                a = (d["asks"] + [(None, None)] * 5)[:5]
+                self.depth_rows.append([now.strftime("%H:%M:%S"), q["source"], t, price, vol]
+                                       + [x for pq in b for x in pq] + [x for pq in a for x in pq]
+                                       + [d.get("tot_buy"), d.get("tot_sell")])
+        p = self.prev.get(t)
+        sidev = 0
+        if p and vol and p["vol"] and vol > p["vol"]:
+            dv = vol - p["vol"]
+            if p["ask"] and price >= p["ask"]:
+                sidev = 1
+            elif p["bid"] and price <= p["bid"]:
+                sidev = -1
+            elif price != p["price"]:
+                sidev = 1 if price > p["price"] else -1
+            else:
+                sidev = p["side"]
+            if sidev > 0:
+                m[0] += dv
+            elif sidev < 0:
+                m[1] += dv
+            else:
+                m[2] += dv
+        if vol:
+            self.prev[t] = {"vol": vol, "price": price, "bid": bid or (p or {}).get("bid"),
+                            "ask": ask or (p or {}).get("ask"), "side": sidev or (p or {}).get("side", 0)}
+
+    def recent(self, t, now, minutes=15):
+        buy = sell = 0.0
+        tb = ts = None
+        for k in range(minutes):
+            m = self.minutes.get((t, (now - timedelta(minutes=k)).strftime("%H:%M")))
+            if m:
+                buy, sell = buy + m[0], sell + m[1]
+                if tb is None and m[4]:
+                    tb, ts = m[4], m[5]
+        return buy, sell, tb, ts
+
+    def save(self, day):
+        os.makedirs(OUT, exist_ok=True)
+        with open(f"{OUT}/flow_{day}.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["ticker", "minute_ist", "buyer_initiated_qty", "seller_initiated_qty", "unclassified_qty", "updates",
+                        "waiting_to_buy", "waiting_to_sell", "last_price"])
+            for (t, mm), v in sorted(self.minutes.items()):
+                w.writerow([t, mm] + v)
+        with open(f"{OUT}/depth_{day}.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["received_ist", "source", "ticker", "price", "volume"]
+                       + [f"bid{i}_{k}" for i in range(1, 6) for k in ("price", "qty")]
+                       + [f"ask{i}_{k}" for i in range(1, 6) for k in ("price", "qty")] + ["waiting_to_buy", "waiting_to_sell"])
+            w.writerows(self.depth_rows)
+
+
 # ---------- the loop ----------
 def run(until, send, opening=True, stop=None):
+    import queue
+    from . import preopen
+
     stop = stop or threading.Event()
     today = datetime.now(IST).date()
-    feed = Feed()
+    day = today.isoformat()
+    feed, flow = Feed(), Flow()
     unlocks, watchers, people, every = targets(today)
     focus = sorted(set(unlocks) | set(watchers))
     stream_list = sorted(set(every) | set(focus) | {"^NSEI"})
     print(f"live feed: {len(focus)} stocks on alert watch ({len(unlocks)} in unlock week), "
-          f"{len(stream_list)} recorded from the stream")
-
-    loop = asyncio.new_event_loop()
-    th = threading.Thread(target=lambda: loop.run_until_complete(yahoo_stream(feed, stream_list, stop)), daemon=True)
-    th.start()
+          f"{len(stream_list)} recorded from the Yahoo stream", flush=True)
 
     ex = Exchanges()
     ex.load_bse_codes()
+    cookies = lambda: "; ".join(f"{k}={v}" for k, v in ex.nse.cookies.items())
+    q_in = queue.Queue()
+    stats = {"msgs": 0, "data": 0, "drops": 0, "connected": set(), "samples": []}
+    samples = {}
+
+    async def streams():
+        await asyncio.gather(yahoo_stream(feed, stream_list, stop),
+                             nse_streams([t.replace(".NS", "") for t in focus], q_in, stop, stats, cookies, samples))
+
+    loop = asyncio.new_event_loop()
+    th = threading.Thread(target=lambda: loop.run_until_complete(streams()), daemon=True)
+    th.start()
+
     avg = avg_volumes(focus)
     done = {t: set() for t in focus}       # thresholds already alerted today
     seen = set()                            # later sessions: the first look at a stock only records what already happened
     hist = {t: [] for t in focus}           # (time, price) for the fast-move rule
-    last_fast, market, traded = {}, None, set()
-    i, last_report, last_save, last_mkt = 0, 0.0, time.time(), 0.0
+    last_fast, market, traded, last_stream, stream_age = {}, None, set(), {}, []
+    i, last_poll, last_report, last_save, last_mkt = 0, 0.0, 0.0, time.time(), 0.0
+    pre_snaps, pre_done = [], set()
+    follow_syms = {t.replace(".NS", "") for t in set(focus) | set(every)}
+
+    def handle(t, q, now):
+        if q.get("chg") is None:
+            return
+        with feed.lock:
+            feed.quotes.append([now.strftime("%H:%M:%S"), q["source"], t, q["price"], round(q["chg"], 2),
+                                q["volume"], q["bid"], q["ask"], q["time"].strftime("%H:%M:%S") if q["time"] else ""])
+            if q["source"] == "NSE" and q["time"]:
+                feed.age.append((now - q["time"]).total_seconds())
+        if q["source"].startswith("NSE"):
+            flow.update(t, q, now)
+        if (q["time"] and q["time"].date() == today) or (q["source"] == "NSE stream" and q.get("volume")):
+            traded.add(t)
+        if t in traded:   # NSE confirmed a trade today: skips holidays and stocks not traded yet
+            check(t, q, now, unlocks, watchers, people, avg, done, hist, last_fast, market, send,
+                  silent=not opening and t not in seen, flow=flow)
+            seen.add(t)
+
+    def preopen_snap(label):
+        try:
+            snap = preopen.rows(preopen.fetch(ex.nse))
+        except Exception as e:
+            print("pre-open fetch failed:", e)
+            snap = None
+        if snap:
+            pre_snaps.append((label, snap))
+
+    def preopen_step(now):
+        hms = now.strftime("%H:%M:%S")
+        for st in preopen.SNAP_TIMES:
+            if hms >= st and st not in pre_done and hms < "09:12:00":
+                pre_done.add(st)
+                preopen_snap(st)
+        if hms < "09:08:30":
+            return
+        pre_done.add("final")
+        if not pre_snaps or pre_snaps[-1][0] != preopen.SNAP_TIMES[-1]:
+            preopen_snap("final")   # started late: NSE keeps the day's final pre-open book after 9:08
+        preopen.save(OUT, day, pre_snaps, follow_syms)
+        final = pre_snaps[-1][1] if pre_snaps else {}
+        print(f"pre-open: {len(final)} stocks recorded, {len(pre_snaps)} snapshots", flush=True)
+        if not opening or hms >= "09:20:00":
+            return
+        for t in focus:
+            sym = t.replace(".NS", "")
+            r = final.get(sym)
+            if not r:
+                continue
+            e = unlocks.get(t)
+            msg = preopen.alert(sym, r, e, (e or {}).get("company") or ex.names.get(sym) or sym, clean)
+            if msg:
+                for c in people:
+                    if (e and wants(c, e.get("risk", "info"), t)) or (not e and c["id"] in watchers.get(t, [])):
+                        send(c["id"], msg, "new")
 
     while not stop.is_set():
         now = datetime.now(IST)
         hhmm = now.strftime("%H:%M")
         if hhmm >= until or hhmm > "15:35":
             break
+        if now.weekday() < 5 and hhmm >= "09:00" and "final" not in pre_done:
+            preopen_step(now)
         if hhmm < OPEN or not focus:
-            time.sleep(10)
+            time.sleep(2 if hhmm >= "08:59" else 10)
             continue
         if time.time() - last_mkt > 60:
             try:
@@ -348,49 +609,63 @@ def run(until, send, opening=True, stop=None):
             except Exception:
                 pass
             last_mkt = time.time()
-        # NSE and BSE work through the list half a cycle apart, so each stock gets a fresh price twice per cycle
-        n, k = len(focus), i // 2
-        if i % 2 == 1 and ex.bse_code:
-            t = focus[(k + n // 2) % n]
-            use_bse = t.replace(".NS", "") in ex.isin
-        else:
-            t, use_bse = focus[k % n], False
-        i += 1
-        sym = t.replace(".NS", "")
-        try:
-            q = ex.bse_quote(sym) if use_bse else ex.nse_quote(sym)
-        except Exception:
-            q = None
-        if q:
-            with feed.lock:
-                feed.quotes.append([now.strftime("%H:%M:%S"), q["source"], t, q["price"], round(q["chg"], 2),
-                                    q["volume"], q["bid"], q["ask"], q["time"].strftime("%H:%M:%S") if q["time"] else ""])
-                if q["time"]:
-                    feed.age.append((now - q["time"]).total_seconds())
-            if q["time"] and q["time"].date() == today:
-                traded.add(t)
-            if t in traded:   # NSE confirmed a trade today: skips holidays and stocks not traded yet
-                check(t, q, now, unlocks, watchers, people, avg, done, hist, last_fast, market, send,
-                      silent=not opening and t not in seen)
-                seen.add(t)
+        # 1) everything NSE pushed since the last pass
+        while True:
+            try:
+                sym, q = q_in.get_nowait()
+            except queue.Empty:
+                break
+            t = sym + ".NS"
+            last_stream[t] = time.time()
+            if q.get("sent"):
+                stream_age.append((now - q["sent"]).total_seconds())
+            handle(t, q, now)
+        # 2) polling for stocks the stream has not updated in the last 45 seconds
+        if time.time() - last_poll >= POLL_GAP:
+            stale = [t for t in focus if time.time() - last_stream.get(t, 0) > 45]
+            if stale:
+                last_poll = time.time()
+                n, k = len(stale), i // 2
+                if i % 2 == 1 and ex.bse_code:
+                    t = stale[(k + n // 2) % n]
+                    use_bse = t.replace(".NS", "") in ex.isin
+                else:
+                    t, use_bse = stale[k % n], False
+                i += 1
+                sym = t.replace(".NS", "")
+                try:
+                    q = ex.bse_quote(sym) if use_bse else ex.nse_quote(sym)
+                except Exception:
+                    q = None
+                if q:
+                    handle(t, q, now)
         if time.time() - last_report > 900:
-            print(now.strftime("%H:%M"), feed.lag_report(), flush=True)
+            med = f"{statistics.median(stream_age[-500:]):.1f}s" if stream_age else "no data"
+            print(now.strftime("%H:%M"), feed.lag_report(),
+                  f"| NSE push stream: {len(stats['connected'])} connected, {stats['data']} price messages, "
+                  f"send-to-receive {med}, {stats['drops']} drops", flush=True)
             last_report = time.time()
         if time.time() - last_save > 600:
-            feed.save(today.isoformat())
+            feed.save(day)
+            flow.save(day)
             last_save = time.time()
-        time.sleep(POLL_GAP)
+        time.sleep(0.5)
 
     stop.set()
     th.join(timeout=15)
-    feed.save(today.isoformat())
+    feed.save(day)
+    flow.save(day)
+    os.makedirs(OUT, exist_ok=True)
+    with open(f"{OUT}/stream_samples_{day}.jsonl", "w") as f:
+        for s in stats["samples"]:
+            f.write(json.dumps(s) + "\n")
     print(feed.lag_report())
-    print(f"live feed finished: {feed.yahoo_msgs} stream updates, {len(feed.bars)} minute bars, "
-          f"{len(feed.quotes)} exchange quotes")
+    print(f"live feed finished: {feed.yahoo_msgs} Yahoo updates, {stats['data']} NSE push messages, "
+          f"{len(feed.bars)} minute bars, {len(feed.quotes)} quotes, {len(flow.depth_rows)} order-book rows")
     return feed
 
 
-def check(t, q, now, unlocks, watchers, people, avg, done, hist, last_fast, market, send, silent):
+def check(t, q, now, unlocks, watchers, people, avg, done, hist, last_fast, market, send, silent, flow=None):
     e = unlocks.get(t)
     chg = q["chg"]
     fired = []
@@ -434,6 +709,17 @@ def check(t, q, now, unlocks, watchers, people, avg, done, hist, last_fast, mark
         lines.append(f"⏱️ Moved <b>{fast:+.1f}%</b> in the last {FAST_WINDOW} minutes.")
     if pace and pace >= 2:
         lines.append(f"📊 Trading at <b>{pace:.1f}×</b> its usual pace{'. Big sellers may be active.' if e else '.'}")
+    if flow:
+        buy, sell, tb, ts = flow.recent(t, now)
+        if buy + sell > 0:
+            share = 100 * sell / (buy + sell)
+            if share >= 50:
+                lines.append(f"🧾 Last 15 minutes: <b>{share:.0f}%</b> of shares traded were sellers accepting buyers' prices.")
+            else:
+                lines.append(f"🧾 Last 15 minutes: <b>{100 - share:.0f}%</b> of shares traded were buyers paying sellers' prices.")
+        if tb and ts and (ts / tb >= 1.5 or tb / ts >= 1.5):
+            lines.append(f"📚 Waiting to sell: {ts / tb:.1f}× the shares waiting to buy." if ts > tb else
+                         f"📚 Waiting to buy: {tb / ts:.1f}× the shares waiting to sell.")
     if q.get("bid") and q.get("ask"):
         lines.append(f"Best buyer ₹{q['bid']:,.2f}, best seller ₹{q['ask']:,.2f}.")
     top = ((e or {}).get("holders") or {}).get("top") or []
@@ -444,4 +730,4 @@ def check(t, q, now, unlocks, watchers, people, avg, done, hist, last_fast, mark
     risk = (e or {}).get("risk", "info")
     for c in people:
         if (e and wants(c, risk, t)) or (not e and c["id"] in watchers.get(t, [])):
-            send(c["id"], msg)
+            send(c["id"], msg, "price")

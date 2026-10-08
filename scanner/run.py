@@ -2,12 +2,14 @@
 
 Run:  python -m scanner.run --until 13:00          (loop until 1 pm IST)
       python -m scanner.run --backfill 2026-10-08   (score one past day, print alerts, send nothing)
+      python -m scanner.run --evening               (evening reports: money flows, insiders, shareholding)
 Env:  TELEGRAM_BOT_TOKEN, SUBSCRIBERS_KEY, DASHBOARD_URL   (GitHub Actions secrets / variables)
       ALERTS_LIVE=1 to actually send; anything else prints only (dry run).
+      PRICE_ALERTS_LIVE=1 to also send live price alerts (off while the tracker site still sends its own).
+      PREVIEW_CHAT=<chat id>: newer message types (brief, pre-open, insiders, flows, shareholding) go only there.
 """
 import argparse
 import html
-import json
 import os
 import re
 import sys
@@ -25,6 +27,8 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 KEY = os.environ.get("SUBSCRIBERS_KEY", "")
 SITE = os.environ.get("DASHBOARD_URL", "https://nse-lockin-tracker.netlify.app").rstrip("/")
 LIVE = os.environ.get("ALERTS_LIVE") == "1"
+PRICE_LIVE = os.environ.get("PRICE_ALERTS_LIVE") == "1"
+PREVIEW = os.environ.get("PREVIEW_CHAT", "").strip()
 MIN_MCAP_CR = 300        # market-wide alerts only for companies worth at least this much
 POLL_SECONDS = 90
 DIGEST_TIMES = ("12:30", "16:00")
@@ -115,9 +119,16 @@ def esc(s):
 
 
 def crore(x):
+    """Money in ₹ crore, written the way Indian readers expect: ₹45 lakh, ₹12.5 cr, ₹980 cr, ₹1.25 lakh cr."""
     if x is None:
         return None
-    return f"₹{x / 1e5:,.2f} lakh cr" if x >= 1e5 else f"₹{x:,.0f} cr"
+    if x >= 1e5:
+        return f"₹{x / 1e5:,.2f} lakh cr"
+    if x >= 100:
+        return f"₹{x:,.0f} cr"
+    if x >= 1:
+        return f"₹{x:,.1f} cr"
+    return f"₹{x * 100:,.0f} lakh"
 
 
 def fmt(ev):
@@ -149,19 +160,28 @@ def digest(events, title):
                                                    for e in sorted(events, key=lambda e: -(e["mcap_cr"] or 0))[:4]]}
 
 
-def chats():
+def chats(news_only=True):
+    """Subscribed chats. news_only drops chats that turned company news off in the bot's settings."""
     if not KEY:
         return []
     r = requests.get(f"{SITE}/api/subscribers", headers={"x-subscribers-key": KEY}, timeout=30)
     r.raise_for_status()
-    return [c for c in r.json().get("chats", []) if (c.get("prefs") or {}).get("news", True)]
+    return [c for c in r.json().get("chats", []) if not news_only or (c.get("prefs") or {}).get("news", True)]
 
 
 SEND_LOCK = threading.Lock()
 
 
-def send(chat_id, msg):
+def send(chat_id, msg, kind="news"):
+    """kind: 'news' (company-news alerts), 'price' (live price alerts), 'new' (newer message types)."""
     with SEND_LOCK:
+        if kind == "price" and not PRICE_LIVE:
+            print(f"[price alert, not sent -> {chat_id}]\n{msg['text']}\n")
+            return
+        if kind == "new" and PREVIEW:
+            if str(chat_id) != PREVIEW:
+                return
+            msg = {**msg, "text": "🧪 <i>Preview: only you get this for now.</i>\n" + msg["text"]}
         _send(chat_id, msg)
 
 
@@ -227,18 +247,28 @@ def backfill(day, nse=None):
     return evs
 
 
+def wait_until(hhmm):
+    while datetime.now(IST).strftime("%H:%M") < hhmm:
+        time.sleep(20)
+
+
 def session(until, opening=True, catchup_minutes=10):
+    from . import brief, insider, stream
     nse = NSE()
     people = chats()
-    print(f"{len(people)} chats; live={LIVE}; until {until} IST")
-    # Live prices run alongside in their own thread (exchange quotes for alerts, Yahoo stream for minute bars)
-    from . import stream
+    everyone = chats(news_only=False)
+    print(f"{len(people)} chats; live={LIVE}; price alerts live={PRICE_LIVE}; preview={PREVIEW or 'off'}; until {until} IST")
+    try:
+        unlocks = stream.targets(datetime.now(IST).date())[0]
+    except Exception:
+        unlocks = {}
+    if opening:
+        wait_until("08:30")
+    # Live prices run alongside in their own thread (NSE push stream, polling fallback, pre-open, Yahoo bars)
     feed = threading.Thread(target=stream.run, args=(until, send, opening), daemon=True)
     feed.start()
-    seen, pending, sent_keys = set(), [], set()
-    now = datetime.now(IST)
-    # Overnight and pre-market filings since yesterday's close: one opening digest, no individual pings
-    first = True
+    seen, pending, sent_keys, ins_seen = set(), [], set(), set()
+    first, first_ins, last_ins = True, True, 0.0
     sent_digests = set()
     while True:
         now = datetime.now(IST)
@@ -255,16 +285,26 @@ def session(until, opening=True, catchup_minutes=10):
             seen.add(a.get("seq_id") or a.get("an_dt"))
         events = dedupe([e for e in (score(nse, a) for a in fresh) if e], sent_keys)
         if first and opening:
-            # morning session: overnight and pre-market filings go out as one digest, not individual pings
+            # morning session: overnight filings go into the 8:30 brief, not individual pings
             early = [e for e in events if e["importance"] in ("high", "medium") and (e["mcap_cr"] or 0) >= MIN_MCAP_CR]
+            try:
+                cal = requests.get(f"{SITE}/api/data/calendar", timeout=60).json() or []
+                tracked = {e["ticker"].replace(".NS", ""): e["company"] for e in cal if e.get("ticker")}
+                for c in everyone:
+                    tracked.update({t.replace(".NS", ""): t.replace(".NS", "") for t in c.get("watch") or []})
+                b = brief.build(nse, now, cal, nse.mcap or load_market_caps(), early, tracked, esc, crore, SITE)
+                for c in everyone:
+                    send(c["id"], b, "new")
+            except Exception as ex:
+                print("brief failed:", ex)
             if early:
                 msg = digest(early, "Before the open: company news overnight")
                 for c in people:
-                    send(c["id"], msg)
+                    if not PREVIEW or str(c["id"]) != PREVIEW:   # the preview chat already has it in the brief
+                        send(c["id"], msg)
             first = False
         elif first:
             # later session: only catch up on the last few minutes; older filings were handled by the earlier session
-            cutoff = (now - timedelta(minutes=catchup_minutes)).strftime("%d-%b-%Y %H:%M:%S")
             recent = [e for e in events if _when(e) >= now - timedelta(minutes=catchup_minutes)]
             for e in recent:
                 for cid in route(e, people):
@@ -276,6 +316,19 @@ def session(until, opening=True, catchup_minutes=10):
                     send(cid, fmt(e))
                 if e["importance"] == "medium" and (e["mcap_cr"] or 0) >= MIN_MCAP_CR:
                     pending.append(e)
+        if time.time() - last_ins >= 600:   # insider trades, every 10 minutes
+            last_ins = time.time()
+            try:
+                since = now - timedelta(minutes=catchup_minutes) if first_ins and not opening else None
+                for t in insider.fetch(nse, now, ins_seen, since):
+                    mcap = nse.market_cap(t["symbol"])
+                    for c in people:
+                        watched = f"{t['symbol']}.NS" in (c.get("watch") or [])
+                        if insider.instant(t, mcap, watched, f"{t['symbol']}.NS" in unlocks):
+                            send(c["id"], insider.fmt(t, mcap, esc, crore), "new")
+            except Exception as ex:
+                print("insider check failed:", ex)
+            first_ins = False
         hhmm = now.strftime("%H:%M")
         for dt_ in DIGEST_TIMES:
             if hhmm >= dt_ and dt_ not in sent_digests and pending:
@@ -287,7 +340,7 @@ def session(until, opening=True, catchup_minutes=10):
                 pending, _ = [], sent_digests.add(dt_)
         if int(time.time()) % 900 < POLL_SECONDS:  # refresh subscribers every ~15 minutes
             try:
-                people = chats()
+                people, everyone = chats(), chats(news_only=False)
             except Exception:
                 pass
         time.sleep(POLL_SECONDS)
@@ -295,14 +348,47 @@ def session(until, opening=True, catchup_minutes=10):
     print("session finished")
 
 
+def evening():
+    """Evening reports (about 7:15 pm): money flows, insider and big-holder trades, shareholding shifts."""
+    from . import flows, holdings, insider
+    nse = NSE()
+    caps = nse.mcap = load_market_caps()
+    day = datetime.now(IST)
+    people, everyone = chats(), chats(news_only=False)
+    print(f"evening reports for {day:%d %b}: {len(everyone)} chats; live={LIVE}; preview={PREVIEW or 'off'}")
+    if day.weekday() >= 5:
+        print("weekend: nothing to report")
+        return
+    jobs = [("money flows", lambda: flows.report(nse, day, esc), everyone),
+            ("insiders", lambda: insider.digest(insider.fetch(nse, day), insider.big_holders(nse, day), caps, esc, crore,
+                                                f"Insider and big-holder trades, {day:%d %b}"), people),
+            ("shareholding", lambda: holdings.digest(holdings.shifts(nse, day, caps), esc, crore,
+                                                     f"Shareholding shifts, {day:%d %b}"), people)]
+    for name, build, to in jobs:
+        try:
+            msg = build()
+        except Exception as ex:
+            print(f"{name} failed:", ex)
+            continue
+        if not msg:
+            print(f"{name}: nothing notable today")
+            continue
+        print(f"{name}:\n{msg['text']}\n")
+        for c in to:
+            send(c["id"], msg, "new")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--until", default="15:40")
     p.add_argument("--backfill")
     p.add_argument("--no-opening", action="store_true", help="later session: skip the overnight digest")
+    p.add_argument("--evening", action="store_true", help="evening reports")
     args = p.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
-    if args.backfill:
+    if args.evening:
+        evening()
+    elif args.backfill:
         a, _, b = args.backfill.partition(":")
         d0 = datetime.strptime(a, "%Y-%m-%d")
         d1 = datetime.strptime(b, "%Y-%m-%d") if b else d0
