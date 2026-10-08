@@ -1,0 +1,53 @@
+name: Market-hours scanner
+
+on:
+  schedule:
+    - cron: "25 3 * * 1-5"   # 08:55 IST Mon-Fri: morning session until 13:00 IST
+    - cron: "25 7 * * 1-5"   # 12:55 IST Mon-Fri: afternoon session until 19:00 IST (post-market results included)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "session or backfill"
+        default: backfill
+      date:
+        description: "backfill date (YYYY-MM-DD)"
+        default: ""
+      until:
+        description: "session end time IST (HH:MM)"
+        default: "15:40"
+
+concurrency:
+  group: scanner-${{ github.event.schedule || github.event.inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      SUBSCRIBERS_KEY: ${{ secrets.SUBSCRIBERS_KEY }}
+      DASHBOARD_URL: ${{ vars.DASHBOARD_URL }}
+      ALERTS_LIVE: ${{ vars.ALERTS_LIVE }}
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Morning session
+        if: github.event.schedule == '25 3 * * 1-5'
+        run: python -m scanner.run --until 13:00
+      - name: Afternoon session
+        if: github.event.schedule == '25 7 * * 1-5'
+        run: python -m scanner.run --until 19:00 --no-opening
+      - name: Manual run
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "session" ]; then
+            python -m scanner.run --until "${{ github.event.inputs.until }}"
+          else
+            python -m scanner.run --backfill "${{ github.event.inputs.date || '2026-10-08' }}"
+          fi
