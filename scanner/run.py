@@ -189,10 +189,21 @@ def _when(e):
         return datetime.now(IST)
 
 
-def backfill(day):
-    nse = NSE()
+def dedupe(events, seen_keys):
+    """One alert per company and category per day."""
+    out = []
+    for e in events:
+        k = (e["symbol"], e["category"])
+        if k not in seen_keys:
+            seen_keys.add(k)
+            out.append(e)
+    return out
+
+
+def backfill(day, nse=None):
+    nse = nse or NSE()
     raw = nse.announcements(day)
-    evs = [e for e in (score(nse, a) for a in raw) if e]
+    evs = dedupe([e for e in (score(nse, a) for a in raw) if e], set())
     by = {}
     for e in evs:
         by.setdefault(e["importance"], []).append(e)
@@ -211,7 +222,7 @@ def session(until, opening=True, catchup_minutes=10):
     nse = NSE()
     people = chats()
     print(f"{len(people)} chats; live={LIVE}; until {until} IST")
-    seen, pending = set(), []
+    seen, pending, sent_keys = set(), [], set()
     now = datetime.now(IST)
     # Overnight and pre-market filings since yesterday's close: one opening digest, no individual pings
     first = True
@@ -229,7 +240,7 @@ def session(until, opening=True, catchup_minutes=10):
         fresh = [a for a in raw if (a.get("seq_id") or a.get("an_dt")) not in seen]
         for a in fresh:
             seen.add(a.get("seq_id") or a.get("an_dt"))
-        events = [e for e in (score(nse, a) for a in fresh) if e]
+        events = dedupe([e for e in (score(nse, a) for a in fresh) if e], sent_keys)
         if first and opening:
             # morning session: overnight and pre-market filings go out as one digest, not individual pings
             early = [e for e in events if e["importance"] in ("high", "medium") and (e["mcap_cr"] or 0) >= MIN_MCAP_CR]
@@ -278,6 +289,15 @@ if __name__ == "__main__":
     args = p.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     if args.backfill:
-        backfill(datetime.strptime(args.backfill, "%Y-%m-%d"))
+        a, _, b = args.backfill.partition(":")
+        d0 = datetime.strptime(a, "%Y-%m-%d")
+        d1 = datetime.strptime(b, "%Y-%m-%d") if b else d0
+        nse = NSE()
+        while d0 <= d1:
+            if d0.weekday() < 5:
+                backfill(d0, nse)
+                print("=" * 60)
+                time.sleep(3)
+            d0 += timedelta(days=1)
     else:
         session(args.until, opening=not args.no_opening)

@@ -53,15 +53,22 @@ def classify(desc, text):
     if d == "Bagging/Receiving of orders/contracts" or (d in ("Press Release", "General Updates", "Updates") and ORDER_WORDS.search(t)
                                                           and re.search(r"\b(receiv|bag|won|secur|award)", low)):
         return ("Order win", "sized", "positive")
-    if d == "Corporate Insolvency Resolution Process" or "insolvency" in low and "admit" in low:
-        return ("Insolvency", "high", "negative")
+    if d == "Corporate Insolvency Resolution Process" or "insolvency" in low:
+        # Only a fresh admission/initiation is news; updates, CoC meetings and creditor filings are routine
+        fresh = re.search(r"admi(t|ssion)|initiat|commence|appoint\w* (an? )?(interim )?resolution professional", low)
+        routine = re.search(r"update|reconciliation|postpone|coc meeting|meeting of the committee", low)
+        if fresh and not routine:
+            return ("Insolvency case admitted", "high", "negative")
+        return ("Insolvency update", "low", "negative")
     if d == "Change in Auditors" and re.search(r"resign", low):
         return ("Auditor resigned", "high", "negative")
     if re.search(r"\bbuy[- ]?back\b", low) and re.search(r"approv|consider|board", low):
         return ("Buyback", "high", "positive")
     if re.search(r"\bbonus\b", low) and re.search(r"issue|share|approv|recommend", low):
         return ("Bonus shares", "high", "positive")
-    if re.search(r"\bopen offer\b", low):
+    if re.search(r"\bopen offer\b", low) or (d == "Disclosure under SEBI Takeover Regulations" and "offer" in low):
+        if re.search(r"pre-?offer|post-?offer|corrigendum|letter of offer|recommendation|dispatch|completion|advertisement", low):
+            return ("Open offer (process step)", "low", "neutral")
         return ("Open offer", "high", "positive")
     if re.search(r"sub-?division|stock split|split of (equity )?shares", low):
         return ("Stock split", "medium", "positive")
