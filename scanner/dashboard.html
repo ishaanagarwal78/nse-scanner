@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live NSE feed</title>
+<style>
+  :root {
+    --bg: #f3f1ec; --panel: #fbfaf7; --ink: #1d1f22; --muted: #6b6f76; --rule: #dcd8cf;
+    --up: #0f7a5c; --up-soft: #d6ece4; --down: #b4441c; --down-soft: #f4dccf; --sel: #ebe6da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16181b; --panel: #1d2024; --ink: #e8e6e1; --muted: #949891; --rule: #2e3237;
+            --up: #45c19a; --up-soft: #1d3a31; --down: #f08a5d; --down-soft: #43281d; --sel: #262a2f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 "Segoe UI", system-ui, sans-serif;
+         font-variant-numeric: tabular-nums; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 22px; padding: 16px 20px 12px;
+           border-bottom: 1px solid var(--rule); }
+  h1 { font-size: 19px; margin: 0 8px 0 0; font-weight: 650; }
+  .stat { color: var(--muted); }
+  .stat b { color: var(--ink); font-weight: 600; }
+  form { margin-left: auto; display: flex; gap: 6px; }
+  input { font: inherit; padding: 5px 8px; width: 150px; border: 1px solid var(--rule); background: var(--panel);
+          color: var(--ink); border-radius: 6px; text-transform: uppercase; }
+  button { font: inherit; padding: 5px 12px; border: 1px solid var(--ink); background: var(--ink); color: var(--bg);
+           border-radius: 6px; cursor: pointer; }
+  button:focus-visible, input:focus-visible, tr:focus-visible { outline: 2px solid var(--up); outline-offset: 1px; }
+  main { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, 1fr); gap: 16px; padding: 16px 20px; }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; } form { margin-left: 0; } }
+  .panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; }
+  .scroll { max-height: calc(100vh - 120px); overflow: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { position: sticky; top: 0; background: var(--panel); text-align: right; font-weight: 600; color: var(--muted);
+       font-size: 12px; padding: 9px 10px; border-bottom: 1px solid var(--rule); cursor: pointer; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  tr.row { cursor: pointer; }
+  tr.row:hover, tr.row.sel { background: var(--sel); }
+  .sym { font-weight: 600; }
+  .note { display: block; color: var(--muted); font-size: 12px; }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .flash-up { animation: fu 0.9s ease-out; } .flash-down { animation: fd 0.9s ease-out; }
+  @keyframes fu { from { background: var(--up-soft); } to { background: transparent; } }
+  @keyframes fd { from { background: var(--down-soft); } to { background: transparent; } }
+  @media (prefers-reduced-motion: reduce) { .flash-up, .flash-down { animation: none; } }
+  .split { display: inline-flex; width: 56px; height: 8px; border-radius: 4px; overflow: hidden; background: var(--rule);
+           vertical-align: middle; margin-right: 6px; }
+  .split i { display: block; height: 100%; }
+  .stale { color: var(--muted); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .dot.on { background: var(--up); }
+  .detail { padding: 16px 18px 18px; }
+  .big { font-size: 30px; font-weight: 650; margin: 2px 0 0; }
+  h2 { font-size: 16px; margin: 0; }
+  h3 { font-size: 13px; margin: 18px 0 6px; color: var(--muted); font-weight: 600; }
+  canvas { width: 100%; display: block; }
+  .book { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; font-size: 13px; }
+  .lvl { position: relative; display: flex; justify-content: space-between; padding: 3px 6px; }
+  .lvl span { position: relative; }
+  .lvl i { position: absolute; top: 1px; bottom: 1px; border-radius: 3px; }
+  .bid i { right: 0; background: var(--up-soft); } .ask i { left: 0; background: var(--down-soft); }
+  .waiting { margin-top: 8px; color: var(--muted); font-size: 13px; }
+  .empty { padding: 40px 18px; color: var(--muted); }
+  .rm { border: none; background: none; color: var(--muted); padding: 0 4px; cursor: pointer; font-size: 15px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Live NSE feed</h1>
+  <span class="stat">Time <b id="clock">–</b></span>
+  <span class="stat">Connected <b id="conn">–</b></span>
+  <span class="stat">NSE to here <b id="delay">–</b></span>
+  <span class="stat">Updates received <b id="msgs">–</b></span>
+  <form id="add"><input id="sym" placeholder="Add a stock" aria-label="NSE symbol" autocomplete="off"><button>Add</button></form>
+</header>
+<main>
+  <section class="panel scroll">
+    <table>
+      <thead><tr>
+        <th data-k="symbol">Stock</th><th data-k="price">Price</th><th data-k="chg">Change</th>
+        <th data-k="volume">Volume</th><th data-k="press">Buyers, 15 min</th>
+        <th data-k="wait" title="Shares waiting to sell divided by shares waiting to buy">Sell ÷ buy</th><th data-k="age">Updated</th><th></th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+  <section class="panel" id="detail"><div class="empty">Select a stock to see its order book and order flow.</div></section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (x, d = 2) => x == null ? "–" : Number(x).toLocaleString("en-IN", { minimumFractionDigits: d, maximumFractionDigits: d });
+const big = (x) => x == null ? "–" : x >= 1e7 ? (x / 1e7).toFixed(2) + " cr" : x >= 1e5 ? (x / 1e5).toFixed(2) + " L" : fmt(x, 0);
+let sel = new URLSearchParams(location.search).get("s") || "";
+let sortK = "chg", sortDir = 1, es = null, lastPrice = {};
+
+function connect() {
+  if (es) es.close();
+  es = new EventSource("/events?sel=" + encodeURIComponent(sel));
+  es.onmessage = (e) => render(JSON.parse(e.data));
+}
+
+function pressure(r) {
+  const t = (r.buy15 || 0) + (r.sell15 || 0);
+  return t ? (r.buy15 / t) : null;
+}
+
+function render(d) {
+  $("clock").textContent = d.clock;
+  $("conn").textContent = `${d.connected} of ${d.following}`;
+  $("delay").textContent = d.delay == null ? "–" : d.delay + " s";
+  $("msgs").textContent = d.messages.toLocaleString("en-IN");
+  const key = (r) => sortK === "press" ? pressure(r) : sortK === "wait" ? (r.waitBuy ? r.waitSell / r.waitBuy : null) : r[sortK];
+  const rows = [...d.rows].sort((a, b) => {
+    const x = key(a), y = key(b);
+    if (x == null) return 1; if (y == null) return -1;
+    return (x > y ? 1 : x < y ? -1 : 0) * (typeof x === "string" ? sortDir : -sortDir);
+  });
+  $("rows").innerHTML = rows.map((r) => {
+    const p = pressure(r), w = r.waitBuy ? r.waitSell / r.waitBuy : null;
+    const cls = r.chg == null ? "" : r.chg >= 0 ? "up" : "down";
+    const moved = lastPrice[r.symbol] != null && r.price != null && r.price !== lastPrice[r.symbol];
+    const flash = moved ? (r.price > lastPrice[r.symbol] ? "flash-up" : "flash-down") : "";
+    return `<tr class="row ${r.symbol === sel ? "sel" : ""}" data-s="${r.symbol}" tabindex="0">
+      <td><span class="dot ${r.live ? "on" : ""}"></span><span class="sym">${r.symbol}</span><span class="note">${r.info || "added by you"}</span></td>
+      <td class="${flash}">${fmt(r.price)}</td>
+      <td class="${cls}">${r.chg == null ? "–" : (r.chg >= 0 ? "+" : "") + r.chg.toFixed(2) + "%"}</td>
+      <td>${big(r.volume)}</td>
+      <td>${p == null ? '<span class="stale">no trades yet</span>' :
+        `<span class="split"><i style="width:${(p * 100).toFixed(0)}%;background:var(--up)"></i><i style="width:${(100 - p * 100).toFixed(0)}%;background:var(--down)"></i></span>${(p * 100).toFixed(0)}%`}</td>
+      <td class="${w == null ? "" : w >= 1.5 ? "down" : w <= 0.67 ? "up" : ""}">${w == null ? "–" : w.toFixed(2) + "×"}</td>
+      <td class="${r.age > 30 ? "stale" : ""}">${r.age == null ? "waiting" : r.age < 2 ? "now" : Math.round(r.age) + " s ago"}</td>
+      <td><button class="rm" title="Stop following" data-rm="${r.symbol}">×</button></td></tr>`;
+  }).join("");
+  d.rows.forEach((r) => (lastPrice[r.symbol] = r.price));
+  if (d.detail) renderDetail(d.detail, d.rows.find((r) => r.symbol === sel));
+}
+
+function renderDetail(x, r) {
+  const el = $("detail");
+  if (!el.querySelector("#price")) {
+    el.innerHTML = `<div class="detail">
+      <h2 id="dname"></h2><span class="note" id="dinfo"></span>
+      <div class="big" id="price"></div><div id="dchg"></div>
+      <h3>Price since this screen opened</h3><canvas id="line" height="150"></canvas>
+      <h3>Order book: 5 best buyers and sellers</h3><div class="book" id="book"></div><div class="waiting" id="waiting"></div>
+      <h3>Shares traded each minute: buyers paying up (above) vs sellers selling down (below)</h3><canvas id="flow" height="150"></canvas>
+    </div>`;
+  }
+  $("dname").textContent = x.symbol;
+  $("dinfo").textContent = x.info || "added by you";
+  $("price").textContent = r && r.price != null ? "₹" + fmt(r.price) : "waiting for the first update";
+  $("dchg").innerHTML = r && r.chg != null ? `<span class="${r.chg >= 0 ? "up" : "down"}">${(r.chg >= 0 ? "+" : "") + r.chg.toFixed(2)}% today</span>
+    <span class="stat"> · NSE time ${r.nse_time || "–"} · ${r.updates} updates</span>` : "";
+  const dp = x.depth || { bids: [], asks: [] };
+  const mx = Math.max(1, ...dp.bids.map((b) => b[1]), ...dp.asks.map((a) => a[1]));
+  const lv = (side, l) => l ? `<div class="lvl ${side}"><i style="width:${(100 * l[1] / mx).toFixed(0)}%"></i><span>${fmt(l[0])}</span><span>${fmt(l[1], 0)}</span></div>` : `<div class="lvl"><span class="stale">–</span></div>`;
+  let h = `<div class="stat">Buyers: price, shares</div><div class="stat">Sellers: price, shares</div>`;
+  for (let i = 0; i < 5; i++) h += lv("bid", dp.bids[i]) + lv("ask", dp.asks[i]);
+  $("book").innerHTML = h;
+  $("waiting").textContent = dp.tot_buy ? `All waiting orders: ${big(dp.tot_buy)} shares to buy, ${big(dp.tot_sell)} to sell.` : "";
+  drawLine($("line"), x.ticks);
+  drawFlow($("flow"), x.minutes);
+}
+
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function prep(c) {
+  const r = devicePixelRatio || 1, w = c.clientWidth, h = c.height;
+  if (c.width !== w * r) { c.width = w * r; c.style.height = h + "px"; c.dataset.h = h; }
+  const g = c.getContext("2d"); g.setTransform(r, 0, 0, r, 0, 0); const H = +c.dataset.h || h;
+  g.clearRect(0, 0, w, H); return [g, w, H];
+}
+function drawLine(c, ticks) {
+  const [g, w, h] = prep(c);
+  if (!ticks || ticks.length < 2) { g.fillStyle = css("--muted"); g.fillText("Collecting prices…", 8, 20); return; }
+  const ps = ticks.map((t) => t[1]), lo = Math.min(...ps), hi = Math.max(...ps), t0 = ticks[0][0], t1 = ticks[ticks.length - 1][0];
+  const pad = (hi - lo) * 0.1 || hi * 0.001, L = 58;
+  const y = (p) => 8 + (h - 22) * (1 - (p - lo + pad) / (hi - lo + 2 * pad));
+  const x = (t) => L + (w - L - 8) * ((t - t0) / Math.max(1, t1 - t0));
+  g.strokeStyle = css("--rule"); g.fillStyle = css("--muted"); g.font = "11px Segoe UI, sans-serif"; g.lineWidth = 1;
+  [hi, (hi + lo) / 2, lo].forEach((p) => { g.beginPath(); g.moveTo(L, y(p)); g.lineTo(w - 8, y(p)); g.stroke(); g.fillText(fmt(p), 4, y(p) + 4); });
+  g.fillText(new Date(t0 * 1000).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }), L, h - 2);
+  g.strokeStyle = ps[ps.length - 1] >= ps[0] ? css("--up") : css("--down"); g.lineWidth = 2; g.beginPath();
+  ticks.forEach((t, i) => (i ? g.lineTo(x(t[0]), y(t[1])) : g.moveTo(x(t[0]), y(t[1])))); g.stroke();
+}
+function drawFlow(c, mins) {
+  const [g, w, h] = prep(c);
+  const mx = Math.max(1, ...mins.map((m) => Math.max(m.buy, m.sell))), mid = (h - 16) / 2, bw = (w - 60) / mins.length;
+  g.fillStyle = css("--muted"); g.font = "11px Segoe UI, sans-serif";
+  g.fillText(big(mx), 4, 12); g.fillText(big(mx), 4, h - 18);
+  g.strokeStyle = css("--rule"); g.beginPath(); g.moveTo(56, mid); g.lineTo(w, mid); g.stroke();
+  mins.forEach((m, i) => {
+    const x0 = 58 + i * bw;
+    g.fillStyle = css("--up"); g.fillRect(x0, mid - (mid - 4) * m.buy / mx, Math.max(1, bw - 2), (mid - 4) * m.buy / mx);
+    g.fillStyle = css("--down"); g.fillRect(x0, mid, Math.max(1, bw - 2), (mid - 4) * m.sell / mx);
+  });
+  g.fillStyle = css("--muted"); g.fillText(mins[0].t, 58, h - 2); g.fillText(mins[mins.length - 1].t, w - 34, h - 2);
+}
+
+$("rows").addEventListener("click", (e) => {
+  const rm = e.target.closest("[data-rm]");
+  if (rm) { fetch("/remove?s=" + rm.dataset.rm); if (rm.dataset.rm === sel) sel = ""; return; }
+  const tr = e.target.closest("tr.row"); if (!tr) return;
+  sel = tr.dataset.s; history.replaceState(null, "", "?s=" + sel); $("detail").innerHTML = ""; connect();
+});
+$("rows").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.closest("tr.row")?.click(); });
+document.querySelectorAll("th[data-k]").forEach((th) => th.addEventListener("click", () => {
+  sortDir = sortK === th.dataset.k ? -sortDir : 1; sortK = th.dataset.k;
+}));
+$("add").addEventListener("submit", async (e) => {
+  e.preventDefault(); const s = $("sym").value.trim().toUpperCase(); if (!s) return;
+  await fetch("/add?s=" + encodeURIComponent(s)); $("sym").value = ""; sel = s; $("detail").innerHTML = ""; connect();
+});
+connect();
+</script>
+</body>
+</html>

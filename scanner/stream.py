@@ -280,6 +280,16 @@ def targets(today):
     return unlocks, watchers, people, every
 
 
+NEAR_DAYS = 14
+
+
+def near_lockins(today, days=NEAR_DAYS, cal=None):
+    """Stocks with any lock-in (anchor 30/90 days, 6 months, promoter 18 months) ending within `days` either side."""
+    cal = cal if cal is not None else requests.get(f"{SITE}/api/data/calendar", timeout=60).json() or []
+    lo, hi = (today - timedelta(days=days)).isoformat(), (today + timedelta(days=days)).isoformat()
+    return {e["ticker"]: e for e in cal if e.get("ticker") and lo <= e.get("free_day", "") <= hi}
+
+
 def wants(chat, risk, ticker):
     """Same rule as the bot: live alerts can be turned off, and 'big only' keeps high-risk unlocks."""
     p = {"big": False, "live": True, **(chat.get("prefs") or {})}
@@ -386,51 +396,57 @@ CAS_URL = "wss://streamer.nseindia.com/streams/cm/cas"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
 
 
+async def nse_stream(url, key, out_q, stop, stats, cookies, samples):
+    """One NSE push connection (reconnects with backoff until `stop` is set). Quotes go to out_q as (key, quote)."""
+    import websockets
+    wait = 2
+    while not stop.is_set():
+        try:
+            async with websockets.connect(url, open_timeout=20, max_size=None, ping_interval=20, user_agent_header=UA,
+                                          additional_headers={"Origin": "https://www.nseindia.com", "Cookie": cookies()}) as ws:
+                wait = 2
+                stats["connected"].add(key)
+                while not stop.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), 5)
+                    except asyncio.TimeoutError:
+                        continue
+                    stats["msgs"] += 1
+                    try:
+                        m = json.loads(raw)
+                    except Exception:
+                        continue
+                    beat = isinstance(m, dict) and "HEARTBEAT" in (m.get("symbol"), m.get("indexName"))
+                    if not beat:
+                        stats["data"] += 1
+                        if samples is not None and samples.get(key, 0) < 40:
+                            samples[key] = samples.get(key, 0) + 1
+                            stats["samples"].append({"stream": key, "at": datetime.now(IST).strftime("%H:%M:%S"), "msg": m})
+                            if samples[key] <= 1:
+                                print(f"NSE stream sample [{key}]:", json.dumps(m)[:300], flush=True)
+                    if key != "cas":
+                        q = from_stream(m)
+                        if q:
+                            out_q.put((key, q))
+        except Exception as e:
+            stats["connected"].discard(key)
+            if stop.is_set():
+                break
+            stats["drops"] += 1
+            if stats["drops"] <= 5:
+                print(f"NSE stream {key} dropped ({type(e).__name__}: {str(e)[:80]}); retrying in {wait}s", flush=True)
+            await asyncio.sleep(wait)
+            wait = min(wait * 2, 120)
+
+
 async def nse_streams(symbols, out_q, stop, stats, cookies, samples):
     """One NSE push connection per followed stock, plus the closing-auction stream (recorded to learn its format)."""
-    import websockets
-
-    async def one(url, key):
-        wait = 2
-        while not stop.is_set():
-            try:
-                async with websockets.connect(url, open_timeout=20, max_size=None, ping_interval=20, user_agent_header=UA,
-                                              additional_headers={"Origin": "https://www.nseindia.com", "Cookie": cookies()}) as ws:
-                    wait = 2
-                    stats["connected"].add(key)
-                    while not stop.is_set():
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), 5)
-                        except asyncio.TimeoutError:
-                            continue
-                        stats["msgs"] += 1
-                        try:
-                            m = json.loads(raw)
-                        except Exception:
-                            continue
-                        beat = isinstance(m, dict) and "HEARTBEAT" in (m.get("symbol"), m.get("indexName"))
-                        if not beat:
-                            stats["data"] += 1
-                            if samples.get(key, 0) < 40:
-                                samples[key] = samples.get(key, 0) + 1
-                                stats["samples"].append({"stream": key, "at": datetime.now(IST).strftime("%H:%M:%S"), "msg": m})
-                                if samples[key] <= 2:
-                                    print(f"NSE stream sample [{key}]:", json.dumps(m)[:700], flush=True)
-                        if key != "cas":
-                            q = from_stream(m)
-                            if q:
-                                out_q.put((key, q))
-            except Exception as e:
-                stats["connected"].discard(key)
-                if stop.is_set():
-                    break
-                stats["drops"] += 1
-                if stats["drops"] <= 5:
-                    print(f"NSE stream {key} dropped ({type(e).__name__}: {str(e)[:80]}); retrying in {wait}s", flush=True)
-                await asyncio.sleep(wait)
-                wait = min(wait * 2, 120)
-
-    await asyncio.gather(*(one(STREAM_URL.format(s), s) for s in symbols), one(CAS_URL, "cas"))
+    tasks = []
+    for i, s in enumerate(symbols):
+        tasks.append(asyncio.create_task(nse_stream(STREAM_URL.format(s), s, out_q, stop, stats, cookies, samples)))
+        await asyncio.sleep(0.3)   # open connections gradually
+    tasks.append(asyncio.create_task(nse_stream(CAS_URL, "cas", out_q, stop, stats, cookies, samples)))
+    await asyncio.gather(*tasks)
 
 
 class Flow:
@@ -447,7 +463,7 @@ class Flow:
         bid, ask = q.get("bid"), q.get("ask")
         if d:
             m[4], m[5] = d.get("tot_buy"), d.get("tot_sell")
-            if len(self.depth_rows) < 600000:
+            if self.depth_rows is not None and len(self.depth_rows) < 600000:
                 b = (d["bids"] + [(None, None)] * 5)[:5]
                 a = (d["asks"] + [(None, None)] * 5)[:5]
                 self.depth_rows.append([now.strftime("%H:%M:%S"), q["source"], t, price, vol]
@@ -513,11 +529,17 @@ def run(until, send, opening=True, stop=None):
     feed, flow = Feed(), Flow()
     unlocks, watchers, people, every = targets(today)
     extra = {x.strip().upper() + ".NS" for x in os.environ.get("STREAM_TEST_SYMBOLS", "").split(",") if x.strip()}
-    for t in extra:   # test only: follow these stocks as if watched, alerts go nowhere
+    try:
+        near = near_lockins(today)
+    except Exception:
+        near = {}
+    # recorded for research (order flow, order books); alerts still go only to unlock-week and watchlist stocks
+    for t in extra | set(near):
         watchers.setdefault(t, [])
     focus = sorted(set(unlocks) | set(watchers))
     stream_list = sorted(set(every) | set(focus) | {"^NSEI"})
-    print(f"live feed: {len(focus)} stocks on alert watch ({len(unlocks)} in unlock week), "
+    print(f"live feed: {len(focus)} stocks followed ({len(unlocks)} in unlock week, {len(near)} with a lock-in ending "
+          f"within {NEAR_DAYS} days), "
           f"{len(stream_list)} recorded from the Yahoo stream", flush=True)
 
     ex = Exchanges()
