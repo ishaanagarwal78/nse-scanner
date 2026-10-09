@@ -194,6 +194,7 @@ def _send(chat_id, msg):
     if msg.get("keyboard"):
         body["reply_markup"] = {"inline_keyboard": msg["keyboard"]}
     r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=body, timeout=30)
+    print(f"sent -> {chat_id}: {msg['text'].splitlines()[0][:80]}", flush=True)
     if r.status_code == 429:
         time.sleep(r.json().get("parameters", {}).get("retry_after", 3))
         requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=body, timeout=30)
@@ -273,7 +274,8 @@ def session(until, opening=True, catchup_minutes=3):
     seen, pending, sent_keys, ins_seen = set(), [], set(), set()
     first, first_ins, last_ins = True, True, 0.0
     ann_streak = ops.Streak("NSE company announcements", 3)
-    sent_digests = set()
+    # digest times already past at start (a restart or late start) are skipped, not sent late
+    sent_digests = {t for t in DIGEST_TIMES if datetime.now(IST).strftime("%H:%M") >= t}
     while True:
         now = datetime.now(IST)
         if now.strftime("%H:%M") >= until:
