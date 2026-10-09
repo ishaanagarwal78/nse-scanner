@@ -57,10 +57,20 @@ def temp_c():
         return None
 
 
+_local = threading.local()
+
+
+def _session():
+    if not hasattr(_local, "s"):   # one kept-alive connection per thread
+        _local.s = requests.Session()
+    return _local.s
+
+
 def tg(method, **body):
     try:
-        return requests.post(f"{API}/{method}", json=body, timeout=60).json()
+        return _session().post(f"{API}/{method}", json=body, timeout=60).json()
     except Exception as e:
+        _local.__dict__.pop("s", None)
         return {"ok": False, "description": str(e)}
 
 
@@ -190,7 +200,7 @@ def _cpu_pct(interval=1.0):
         v = list(map(int, f))
         return sum(v), v[3] + v[4]
     t1, i1 = snap()
-    time.sleep(interval)
+    time.sleep(min(interval, 0.4))
     t2, i2 = snap()
     return 100 * (1 - (i2 - i1) / max(1, t2 - t1))
 
@@ -225,22 +235,43 @@ def usage_view():
     return text, [[B("🔄 Refresh", "usage"), B("⬅️ Menu", "menu")]]
 
 
-def updates_view():
+UPD = {"pending": "?", "sec": "?", "behind": "?", "at": 0}
+
+
+def _refresh_updates():
     app = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sh("git", "-C", app, "fetch", "-q", timeout=60)
-    behind = sh("git", "-C", app, "rev-list", "--count", "HEAD..@{u}")
+    UPD["behind"] = sh("git", "-C", app, "rev-list", "--count", "HEAD..@{u}")
+    lst = sh("bash", "-c", "apt list --upgradable 2>/dev/null", timeout=120)
+    UPD["pending"] = str(lst.count("upgradable"))
+    UPD["sec"] = str(sum(1 for line in lst.splitlines() if "security" in line))
+    UPD["at"] = time.time()
+
+
+def updates_loop():
+    while True:
+        try:
+            _refresh_updates()
+        except Exception:
+            pass
+        time.sleep(3600)
+
+
+def updates_view():
+    app = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    behind = UPD["behind"]
     here = sh("git", "-C", app, "log", "-1", "--format=%h %s (%cr)")
-    pending = sh("bash", "-c", "apt list --upgradable 2>/dev/null | grep -c upgradable || true")
-    sec = sh("bash", "-c", "apt list --upgradable 2>/dev/null | grep -ci security || true")
+    pending, sec = UPD["pending"], UPD["sec"]
     last = sh("bash", "-c", "grep -h 'Packages that will be upgraded' /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -1")
     text = "\n".join([
         "🛡 <b>Updates</b>",
         f"Scanner code: <code>{html.escape(here)}</code>",
         f"{'✅ Up to date' if behind in ('0', '') else f'⬆️ {behind} new change(s) on GitHub'} · checks itself nightly at 3 am",
-        f"System packages waiting: {pending.strip() or '0'} ({sec.strip() or '0'} security) · security updates install themselves daily",
+        f"System packages waiting: {pending} ({sec} security) · security updates install themselves daily",
+        f"<i>Checked {int((time.time() - UPD['at']) // 60)} min ago</i>" if UPD["at"] else "<i>First check running…</i>",
         f"<i>{html.escape(last[-200:])}</i>" if last else "",
     ])
-    return text, [[B("⬆️ Update scanner now", "update"), B("🔄 Refresh", "updates")], [B("⬅️ Menu", "menu")]]
+    return text, [[B("⬆️ Update scanner now", "update"), B("🔄 Check again", "updates:check")], [B("⬅️ Menu", "menu")]]
 
 
 def scanner_view():
@@ -322,9 +353,14 @@ def handle(chat, data, msg_id=None):
         return show(chat, usage_view(), msg_id)
     if data == "updates":
         return show(chat, updates_view(), msg_id)
+    if data == "updates:check":
+        show(chat, ("🛡 Checking for updates…", []), msg_id)
+        _refresh_updates()
+        return show(chat, updates_view(), msg_id)
     if data == "logs":
         return show(chat, logs_view(), msg_id)
     if data == "update":
+        show(chat, ("⬆️ Updating… this takes up to a minute.", []), msg_id)
         sh("sudo", "systemctl", "start", UNITS["update"], timeout=300)
         rev = sh("git", "-C", os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "log", "-1", "--format=%h %s")
         return show(chat, (f"⬆️ Updated to <code>{html.escape(rev)}</code>.\nThe scanner picks it up on its next start "
@@ -354,6 +390,7 @@ def main():
                                   {"command": "usage", "description": "CPU, memory, data, connections"}, {"command": "updates", "description": "Updates"},
                                   {"command": "fan", "description": "Fans"}, {"command": "logs", "description": "Last log lines"}])
     threading.Thread(target=fan_loop, daemon=True).start()
+    threading.Thread(target=updates_loop, daemon=True).start()
     st = load()
     if st.pop("rebooting", False):
         save(st)
@@ -361,23 +398,25 @@ def main():
     while True:
         st = load()
         r = tg("getUpdates", offset=st.get("offset", 0), timeout=50, allowed_updates=["message", "callback_query"])
-        for u in r.get("result", []):
+        batch = r.get("result", [])
+        if batch:
             st = load()
-            st["offset"] = u["update_id"] + 1
+            st["offset"] = batch[-1]["update_id"] + 1
             save(st)
+        for u in batch:
             if "callback_query" in u:
                 cq = u["callback_query"]
                 chat = str(cq["message"]["chat"]["id"])
-                tg("answerCallbackQuery", callback_query_id=cq["id"])
+                threading.Thread(target=tg, args=("answerCallbackQuery",), kwargs={"callback_query_id": cq["id"]}, daemon=True).start()
                 if chat == OWNER:
-                    handle(chat, cq.get("data", ""), cq["message"]["message_id"])
+                    threading.Thread(target=handle, args=(chat, cq.get("data", ""), cq["message"]["message_id"]), daemon=True).start()
             elif "message" in u:
                 chat = str(u["message"]["chat"]["id"])
                 if chat != OWNER:
                     tg("sendMessage", chat_id=chat, text="This bot is private.")
                     continue
                 cmd = (u["message"].get("text") or "").strip().lstrip("/").split("@")[0].split()[0:1]
-                handle(chat, cmd[0].lower() if cmd else "menu")
+                threading.Thread(target=handle, args=(chat, cmd[0].lower() if cmd else "menu"), daemon=True).start()
         if not r.get("ok"):
             time.sleep(10)
 
