@@ -397,13 +397,17 @@ def main():
         tg("sendMessage", chat_id=OWNER, text="🍓 Back online after the reboot.")
     while True:
         st = load()
-        r = tg("getUpdates", offset=st.get("offset", 0), timeout=50, allowed_updates=["message", "callback_query"])
+        # short long-poll: home routers often drop idle connections well before 50 s, which delays every tap
+        r = tg("getUpdates", offset=st.get("offset", 0), timeout=10, allowed_updates=["message", "callback_query"])
         batch = r.get("result", [])
         if batch:
             st = load()
             st["offset"] = batch[-1]["update_id"] + 1
             save(st)
         for u in batch:
+            sent = (u.get("message") or (u.get("callback_query") or {}).get("message") or {}).get("date")
+            if sent and "message" in u:
+                print(f"update received {time.time() - sent:.1f} s after it was sent", flush=True)
             if "callback_query" in u:
                 cq = u["callback_query"]
                 chat = str(cq["message"]["chat"]["id"])
