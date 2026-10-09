@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from curl_cffi import requests as cffi
 
-from . import ops
+from . import memo, ops
 from .rules import amount_crore, classify, size_order
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -276,6 +276,18 @@ def session(until, opening=True, catchup_minutes=3):
     ann_streak = ops.Streak("NSE company announcements", 3)
     # digest times already past at start (a restart or late start) are skipped, not sent late
     sent_digests = {t for t in DIGEST_TIMES if datetime.now(IST).strftime("%H:%M") >= t}
+    # restarted today: carry on from what was saved (no repeats; catch up on what arrived while it was down)
+    day = datetime.now(IST).date().isoformat()
+    prev, catch_from = memo.load(day), None
+    if prev:
+        seen = set(prev.get("news_seen", []))
+        sent_keys = {tuple(k) for k in prev.get("news_keys", [])}
+        ins_seen = set(prev.get("insider_seen", []))
+        sent_digests |= set(prev.get("digests", []))
+        catch_from = memo.down_since(prev, datetime.now(IST))
+        print(f"restart: carrying on from {prev.get('saved_at')} ({len(seen)} filings, {len(ins_seen)} insider files "
+              f"already handled); catching up from {catch_from:%H:%M}", flush=True)
+    brief_done = ops.marked_today("brief")   # a restart after 8:30 must not send the brief again
     while True:
         now = datetime.now(IST)
         if now.strftime("%H:%M") >= until:
@@ -292,7 +304,7 @@ def session(until, opening=True, catchup_minutes=3):
         for a in fresh:
             seen.add(a.get("seq_id") or a.get("an_dt"))
         events = dedupe([e for e in (score(nse, a) for a in fresh) if e], sent_keys)
-        if first and opening:
+        if first and opening and not brief_done:
             # morning session: overnight filings go into the 8:30 brief, not individual pings
             early = [e for e in events if e["importance"] in ("high", "medium") and (e["mcap_cr"] or 0) >= MIN_MCAP_CR]
             try:
@@ -315,7 +327,8 @@ def session(until, opening=True, catchup_minutes=3):
             first = False
         elif first:
             # later session: only catch up on the last few minutes; older filings were handled by the earlier session
-            recent = [e for e in events if _when(e) >= now - timedelta(minutes=catchup_minutes)]
+            start = catch_from or now - timedelta(minutes=catchup_minutes)
+            recent = [e for e in events if _when(e) >= start]
             for e in recent:
                 for cid in route(e, people):
                     send(cid, fmt(e))
@@ -329,7 +342,7 @@ def session(until, opening=True, catchup_minutes=3):
         if time.time() - last_ins >= 600:   # insider trades, every 10 minutes
             last_ins = time.time()
             try:
-                since = now - timedelta(minutes=catchup_minutes) if first_ins and not opening else None
+                since = (catch_from or now - timedelta(minutes=catchup_minutes)) if first_ins and (prev or not opening) else None
                 found = insider.fetch(nse, now, ins_seen, since)
                 if found:
                     from . import publish
@@ -358,6 +371,11 @@ def session(until, opening=True, catchup_minutes=3):
                 people, everyone = chats(), chats(news_only=False)
             except Exception:
                 pass
+        try:
+            memo.save(day, news_seen=seen, news_keys=[list(k) for k in sent_keys], insider_seen=ins_seen,
+                      digests=sent_digests)
+        except Exception as ex:
+            print("could not save state:", ex)
         time.sleep(POLL_SECONDS)
     feed.join(timeout=60)
     print("session finished")

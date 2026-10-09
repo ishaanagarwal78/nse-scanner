@@ -650,6 +650,13 @@ def run(until, send, opening=True, stop=None):
     avg = avg_volumes(focus)
     done = {t: set() for t in focus}       # thresholds already alerted today
     seen = set()                            # later sessions: the first look at a stock only records what already happened
+    from . import memo
+    saved = (memo.load(day) or {}).get("price_done")
+    restored = saved is not None            # restarted today: the saved alerts stop repeats, so moves made while
+    for t, ks in (saved or {}).items():     # the scanner was down are alerted on its first look
+        if t in done:
+            done[t].update(ks)
+    done_n = sum(len(v) for v in done.values())
     hist = {t: [] for t in focus}           # (time, price) for the fast-move rule
     last_fast, market, traded, last_stream, stream_age = {}, None, set(), {}, []
     i, last_poll, last_report, last_save, last_mkt = 0, 0.0, 0.0, time.time(), 0.0
@@ -686,7 +693,7 @@ def run(until, send, opening=True, stop=None):
             traded.add(t)
         if t in traded:   # NSE confirmed a trade today: skips holidays and stocks not traded yet
             check(t, q, now, unlocks, watchers, people, avg, done, hist, last_fast, market, send,
-                  silent=not opening and t not in seen, flow=flow)
+                  silent=not opening and not restored and t not in seen, flow=flow)
             seen.add(t)
 
     def preopen_snap(label):
@@ -785,6 +792,13 @@ def run(until, send, opening=True, stop=None):
                   f"| NSE push stream: {len(stats['connected'])} connected, {stats['data']} price messages, "
                   f"send-to-receive {med}, {stats['drops']} drops", flush=True)
             last_report = time.time()
+        n = sum(len(v) for v in done.values())
+        if n != done_n:                     # an alert was sent or recorded: save at once
+            done_n = n
+            try:
+                memo.save(day, price_done={t: sorted(v) for t, v in done.items() if v})
+            except Exception as e:
+                print("could not save alert state:", e)
         if time.time() - last_save > 600:
             feed.save(day)
             flow.save(day)
