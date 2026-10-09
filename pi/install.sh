@@ -173,11 +173,38 @@ WorkingDirectory=$APP
 EnvironmentFile=$APP/.env
 ExecStart=$APP/.venv/bin/python pi/notify.py %i
 EOF
+TRACKER="$HOME/lockin-tracker"
+if [ -d "$TRACKER/.git" ]; then   # the lock-in tracker's 7:30 pm refresh (private repo, cloned with a deploy key)
+sudo tee /etc/systemd/system/nse-tracker.service >/dev/null <<EOF
+[Unit]
+Description=Lock-in tracker evening refresh (data, evening recap, website data)
+OnFailure=nse-notify@%n.service
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+User=$USER_NAME
+WorkingDirectory=$TRACKER
+Environment=TRACKER_DIR=$TRACKER
+ExecStart=/bin/bash $APP/pi/tracker-refresh.sh
+TimeoutStartSec=40min
+MemoryMax=700M
+EOF
+sudo tee /etc/systemd/system/nse-tracker.timer >/dev/null <<EOF
+[Unit]
+Description=Lock-in tracker refresh on weekdays at 7:30 pm
+[Timer]
+OnCalendar=Mon..Fri 19:30 Asia/Kolkata
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+fi
 # the ops bot and health check may control these services without a password (nothing else)
 S=/usr/bin/systemctl
 cat <<EOF | sudo tee /etc/sudoers.d/nse-ops >/dev/null
 $USER_NAME ALL=(root) NOPASSWD: $S stop nse-day.service, $S start nse-day.service, $S restart nse-day.service, $S stop nse-day, $S start nse-day, $S restart nse-day
-$USER_NAME ALL=(root) NOPASSWD: $S start nse-update.service, $S start --no-block nse-evening.service, $S reboot
+$USER_NAME ALL=(root) NOPASSWD: $S start nse-update.service, $S start --no-block nse-evening.service, $S start --no-block nse-tracker.service, $S reboot
 EOF
 sudo chmod 440 /etc/sudoers.d/nse-ops
 sudo rm -f /etc/sudoers.d/nse-health
@@ -200,6 +227,7 @@ sudo systemctl enable --now nse-health.timer nse-status.timer nse-update.timer n
 if grep -q '^OPS_BOT_TOKEN=.\+' .env; then sudo systemctl enable nse-opsbot.service >/dev/null; sudo systemctl restart nse-opsbot.service; echo "== ops bot running"; fi
 if [ "${ENABLE_SCANNER:-0}" = "1" ]; then
   sudo systemctl enable --now nse-day.timer nse-evening.timer >/dev/null
+  if [ -f /etc/systemd/system/nse-tracker.timer ]; then sudo systemctl enable --now nse-tracker.timer >/dev/null; fi
   echo "== scanner timers ON"
 else
   echo "== scanner timers installed but OFF (run again with ENABLE_SCANNER=1 to switch the Pi on as the main scanner)"

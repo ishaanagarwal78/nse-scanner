@@ -28,7 +28,8 @@ FAN_WIRED = os.environ.get("FAN_WIRED", "0") == "1"   # set to 1 once the relay/
 # modules that a 3.3V "high" cannot switch off); "push" = drive high/low using FAN_ACTIVE_HIGH.
 FAN_DRIVE = os.environ.get("FAN_DRIVE", "float")
 FAN_ON_C, FAN_OFF_C = float(os.environ.get("FAN_ON_C", "55")), float(os.environ.get("FAN_OFF_C", "48"))
-UNITS = {"day": "nse-day.service", "evening": "nse-evening.service", "update": "nse-update.service"}
+UNITS = {"day": "nse-day.service", "evening": "nse-evening.service", "update": "nse-update.service",
+         "tracker": "nse-tracker.service"}
 
 
 def sh(*cmd, timeout=30):
@@ -179,6 +180,7 @@ def status_view():
         f"🟢 Market-hours scanner: <b>{act['day']}</b>" + (f" · next start {html.escape(nxt)}" if act['day'] != 'active' and nxt else ""),
         f"📡 Live stream server: {live}",
         f"🌙 Evening reports: {act['evening']}",
+        f"🗓 Lock-in refresh (7:30 pm): {act['tracker']}",
     ])
     return text, [[B("🔄 Refresh", "status"), B("⬅️ Menu", "menu")]]
 
@@ -279,11 +281,12 @@ def scanner_view():
     text = (f"🟢 <b>Market-hours scanner</b>: {a}\n\nIt starts by itself on weekdays at 8:15 am and stops at 6:50 pm. "
             "Use these only if something looks stuck.")
     return text, [[B("🔄 Restart", "svc:restart"), B("▶️ Start", "svc:start"), B("⏹ Stop", "svc:stop")],
-                  [B("🌙 Run evening reports now", "svc:evening")], [B("⬅️ Menu", "menu")]]
+                  [B("🌙 Run evening reports now", "svc:evening")], [B("🗓 Run lock-in refresh now", "svc:tracker")],
+                  [B("⬅️ Menu", "menu")]]
 
 
 def logs_view():
-    out = sh("journalctl", "-u", UNITS["day"], "-u", UNITS["evening"], "-n", "25", "--no-pager", "-o", "cat")
+    out = sh("journalctl", "-u", UNITS["day"], "-u", UNITS["evening"], "-u", UNITS["tracker"], "-n", "25", "--no-pager", "-o", "cat")
     out = out[-3300:] or "No log lines yet."
     return f"📜 <b>Last log lines</b>\n<pre>{html.escape(out)}</pre>", [[B("🔄 Refresh", "logs"), B("⬅️ Menu", "menu")]]
 
@@ -343,8 +346,8 @@ def handle(chat, data, msg_id=None):
         return show(chat, scanner_view(), msg_id)
     if data.startswith("svc:"):
         act = data.split(":")[1]
-        if act == "evening":
-            sh("sudo", "systemctl", "start", "--no-block", UNITS["evening"])
+        if act in ("evening", "tracker"):
+            sh("sudo", "systemctl", "start", "--no-block", UNITS[act])
         else:
             sh("sudo", "systemctl", act, UNITS["day"])
         time.sleep(2)
