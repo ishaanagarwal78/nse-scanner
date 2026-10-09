@@ -108,7 +108,8 @@ def main(daily=False):
         if market_hours(now):
             sh("sudo", "systemctl", "start", DAY_UNIT)
         problems.append(f"✅ Cooled to {t:.0f}°C; market-hours service restarted.")
-    if words:
+    # the ops bot's power monitor (pi/power.py) watches every 2 s and alerts itself; this is the fallback when it is down
+    if words and sh("systemctl", "is-active", "nse-opsbot.service") != "active":
         problems.append("⚡ Power: " + "; ".join(words) + ".")
     if disk_free < 10:
         problems.append(f"💾 Storage almost full: {disk_free:.0f}% free.")

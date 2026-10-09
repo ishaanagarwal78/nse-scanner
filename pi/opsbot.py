@@ -80,10 +80,12 @@ def B(text, data):
 
 
 MENU = [[B("📊 Status", "status"), B("📈 Usage", "usage")],
-        [B("🌀 Fans", "fan"), B("🛡 Updates", "updates")],
+        [B("⚡ Power", "power"), B("🌀 Fans", "fan")],
         [B("🟢 Scanner", "scanner"), B("📜 Logs", "logs")],
-        [B("⬆️ Update now", "update"), B("🧪 Stress test", "stress")],
+        [B("🛡 Updates", "updates"), B("⬆️ Update now", "update")],
+        [B("🧪 Stress test", "stress")],
         [B("🔁 Reboot Pi", "reboot"), B("⏻ Power off", "poweroff")]]
+POWER = None   # power.Monitor, started in main()
 
 # Written by nse-clean-shutdown.service while the Pi shuts down properly; missing at boot = power cut or crash
 CLEAN_MARK = os.path.expanduser("~/.nse-clean-shutdown")
@@ -176,7 +178,7 @@ def status_view():
     now = datetime.now(IST)
     text = "\n".join([
         f"📊 <b>Pi status</b> · {now:%a %d %b, %I:%M %p}",
-        f"🌡 {t:.1f}°C · ⚡ power {throttle_words()}",
+        f"🌡 {t:.1f}°C · ⚡ power {throttle_words()}" + (f" · ≈{POWER.now_w:.1f} W" if POWER and POWER.now_w else ""),
         f"🧠 {avail} MB memory free · 💾 {disk[3]} free of {disk[1]}",
         f"⏱ up {sh('uptime', '-p').replace('up ', '')}",
         "",
@@ -355,6 +357,9 @@ def handle(chat, data, msg_id=None):
             sh("sudo", "systemctl", act, UNITS["day"])
         time.sleep(2)
         return show(chat, scanner_view(), msg_id)
+    if data == "power":
+        text = POWER.view() if POWER else "⚡ The power monitor is starting; try again in a few seconds."
+        return show(chat, (text, [[B("🔄 Refresh", "power"), B("⬅️ Menu", "menu")]]), msg_id)
     if data == "usage":
         return show(chat, usage_view(), msg_id)
     if data == "updates":
@@ -428,9 +433,16 @@ def main():
         raise SystemExit("OPS_BOT_TOKEN and OWNER_CHAT must be set")
     tg("setMyCommands", commands=[{"command": "menu", "description": "Controls"}, {"command": "status", "description": "Pi status"},
                                   {"command": "usage", "description": "CPU, memory, data, connections"}, {"command": "updates", "description": "Updates"},
-                                  {"command": "fan", "description": "Fans"}, {"command": "logs", "description": "Last log lines"}])
+                                  {"command": "fan", "description": "Fans"}, {"command": "power", "description": "Power, under-voltage, load"}, {"command": "logs", "description": "Last log lines"}])
     threading.Thread(target=fan_loop, daemon=True).start()
     threading.Thread(target=updates_loop, daemon=True).start()
+    global POWER
+    try:
+        import power
+        POWER = power.Monitor(lambda text: tg("sendMessage", chat_id=OWNER, parse_mode="HTML", text=text), fan_is_on)
+        threading.Thread(target=POWER.run, daemon=True).start()
+    except Exception as e:
+        print("power monitor not started:", e, flush=True)
     st = load()
     booted = _uptime() < 600     # this start is a fresh boot, not just the bot restarting
     planned = "reboot" if st.pop("rebooting", False) else "power-off" if st.pop("powering_off", False) else None
