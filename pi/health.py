@@ -90,6 +90,13 @@ def main(daily=False):
     up = sh("uptime", "-p").replace("up ", "")
     problems = []
 
+    # safety net independent of the ops bot: force the fans on when hot (relay on = fan pin pulled low)
+    if t is not None and t >= 65 and os.environ.get("FAN_WIRED") == "1":
+        pin = os.environ.get("FAN_GPIO", "14")
+        if os.environ.get("FAN_DRIVE", "float") == "float":
+            sh("pinctrl", "set", pin, "op", "dl")
+        else:
+            sh("pinctrl", "set", pin, "op", "dh" if os.environ.get("FAN_ACTIVE_HIGH", "1") == "1" else "dl")
     if t is not None and t >= STOP_C and day_active:
         sh("sudo", "systemctl", "stop", DAY_UNIT)
         st["heat_stopped"] = True

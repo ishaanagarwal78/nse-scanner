@@ -24,6 +24,9 @@ STATE = os.path.expanduser("~/.nse-opsbot.json")
 FAN_GPIO = int(os.environ.get("FAN_GPIO", "14"))
 FAN_ACTIVE_HIGH = os.environ.get("FAN_ACTIVE_HIGH", "1") == "1"
 FAN_WIRED = os.environ.get("FAN_WIRED", "0") == "1"   # set to 1 once the relay/transistor module is connected
+# How the pin drives the relay: "float" = on by pulling the pin low, off by letting it float (5V active-low relay
+# modules that a 3.3V "high" cannot switch off); "push" = drive high/low using FAN_ACTIVE_HIGH.
+FAN_DRIVE = os.environ.get("FAN_DRIVE", "float")
 FAN_ON_C, FAN_OFF_C = float(os.environ.get("FAN_ON_C", "55")), float(os.environ.get("FAN_OFF_C", "48"))
 UNITS = {"day": "nse-day.service", "evening": "nse-evening.service", "update": "nse-update.service"}
 
@@ -76,18 +79,28 @@ MENU = [[B("📊 Status", "status"), B("📈 Usage", "usage")],
 def fan_set(on):
     if not FAN_WIRED:
         return False
-    level = "dh" if on == FAN_ACTIVE_HIGH else "dl"
-    sh("pinctrl", "set", str(FAN_GPIO), "op", level)
+    if FAN_DRIVE == "float":
+        if on:
+            sh("pinctrl", "set", str(FAN_GPIO), "op", "dl")
+        else:
+            sh("pinctrl", "set", str(FAN_GPIO), "ip", "pn")
+    else:
+        sh("pinctrl", "set", str(FAN_GPIO), "op", "dh" if on == FAN_ACTIVE_HIGH else "dl")
     return True
 
 
 def fan_is_on():
     out = sh("pinctrl", "get", str(FAN_GPIO))
+    if FAN_DRIVE == "float":
+        return " op " in f" {out} " and "| lo" in out
     hi = "| hi" in out or " hi " in out
     return hi == FAN_ACTIVE_HIGH
 
 
 def fan_loop():
+    st = load()
+    if FAN_WIRED and st.get("fan") in ("on", "off"):   # restore a manual choice after a restart
+        fan_set(st["fan"] == "on")
     while True:
         st = load()
         t = temp_c()
