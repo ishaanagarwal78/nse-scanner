@@ -83,7 +83,10 @@ MENU = [[B("📊 Status", "status"), B("📈 Usage", "usage")],
         [B("🌀 Fans", "fan"), B("🛡 Updates", "updates")],
         [B("🟢 Scanner", "scanner"), B("📜 Logs", "logs")],
         [B("⬆️ Update now", "update"), B("🧪 Stress test", "stress")],
-        [B("🔁 Reboot Pi", "reboot")]]
+        [B("🔁 Reboot Pi", "reboot"), B("⏻ Power off", "poweroff")]]
+
+# Written by nse-clean-shutdown.service while the Pi shuts down properly; missing at boot = power cut or crash
+CLEAN_MARK = os.path.expanduser("~/.nse-clean-shutdown")
 
 
 # ---------- fans ----------
@@ -378,12 +381,46 @@ def handle(chat, data, msg_id=None):
         return show(chat, ("🔁 Reboot the Pi now? It's back in about 2 minutes; the scanner restarts by itself.",
                            [[B("✅ Yes, reboot", "reboot:go"), B("⬅️ No", "menu")]]), msg_id)
     if data == "reboot:go":
-        show(chat, ("🔁 Rebooting… I'll message you when I'm back.", []), msg_id)
+        show(chat, ("🔁 Rebooting… services stop first, then the Pi restarts. I'll message you when I'm back.", []), msg_id)
         st["rebooting"] = True
         save(st)
+        sh("sync")
         sh("sudo", "systemctl", "reboot")
         return
+    if data == "poweroff":
+        return show(chat, ("⏻ <b>Power off the Pi?</b>\n\nIt stops every service, saves everything to the card and shuts down. "
+                           "<b>It will not come back by itself</b>: a Pi 3B has no power button, so to start it again "
+                           "unplug the power and plug it back in.\n\nWhile it's off, the scanner, live prices and evening "
+                           "reports stop. The website and the main bot keep working.",
+                           [[B("✅ Yes, power off", "poweroff:go"), B("⬅️ No", "menu")]]), msg_id)
+    if data == "poweroff:go":
+        show(chat, ("⏻ Shutting down… It's safe to unplug once the green light on the Pi has stopped flashing "
+                    "(about 30 seconds). Plug it back in to start it; I'll message you when it's up.", []), msg_id)
+        st["powering_off"] = True
+        save(st)
+        _heartbeat_off()
+        sh("sync")
+        sh("sudo", "systemctl", "poweroff")
+        return
     show(chat, ("Use the buttons below.", MENU), msg_id)
+
+
+def _uptime():
+    try:
+        return float(open("/proc/uptime").read().split()[0])
+    except Exception:
+        return 1e9
+
+
+def _heartbeat_off():
+    """Tell the website's Pi watcher this is a planned power-off, so it does not raise a "gone quiet" alarm."""
+    try:
+        requests.post(os.environ.get("DASHBOARD_URL", "https://nse-lockin-tracker.netlify.app").rstrip("/") + "/api/data/heartbeat",
+                      headers={"x-tracker-key": os.environ.get("SUBSCRIBERS_KEY", "")}, timeout=10,
+                      json={"at": datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(timespec="seconds"),
+                            "planned_off": True})
+    except Exception:
+        pass
 
 
 def main():
@@ -395,9 +432,21 @@ def main():
     threading.Thread(target=fan_loop, daemon=True).start()
     threading.Thread(target=updates_loop, daemon=True).start()
     st = load()
-    if st.pop("rebooting", False):
-        save(st)
-        tg("sendMessage", chat_id=OWNER, text="🍓 Back online after the reboot.")
+    booted = _uptime() < 600     # this start is a fresh boot, not just the bot restarting
+    planned = "reboot" if st.pop("rebooting", False) else "power-off" if st.pop("powering_off", False) else None
+    save(st)
+    if booted:
+        clean = os.path.exists(CLEAN_MARK)
+        how = (f"✅ The previous shutdown was clean ({open(CLEAN_MARK).read().strip()[:16].replace('T', ' ')})." if clean else
+               "⚠️ <b>The previous shutdown was NOT clean</b>: the power was cut or the Pi crashed. "
+               "Check the power supply and the cable.")
+        try:
+            os.remove(CLEAN_MARK)
+        except OSError:
+            pass
+        lead = {"reboot": "🍓 Back online after the reboot.", "power-off": "🍓 Powered on again after the power-off."}.get(
+            planned, "🍓 The Pi has started.")
+        tg("sendMessage", chat_id=OWNER, parse_mode="HTML", text=f"{lead}\n{how}")
     while True:
         st = load()
         # short long-poll: home routers often drop idle connections well before 50 s, which delays every tap

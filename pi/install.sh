@@ -173,6 +173,20 @@ WorkingDirectory=$APP
 EnvironmentFile=$APP/.env
 ExecStart=$APP/.venv/bin/python pi/notify.py %i
 EOF
+# leaves a marker only when the Pi shuts down properly; the ops bot reports a missing marker at boot (power cut/crash)
+sudo tee /etc/systemd/system/nse-clean-shutdown.service >/dev/null <<EOF
+[Unit]
+Description=Record that the Pi shut down cleanly
+After=local-fs.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=$USER_NAME
+ExecStart=/bin/true
+ExecStop=/bin/sh -c 'date -Iseconds > $HOME/.nse-clean-shutdown; sync'
+[Install]
+WantedBy=multi-user.target
+EOF
 TRACKER="$HOME/lockin-tracker"
 if [ -d "$TRACKER/.git" ]; then   # the lock-in tracker's 7:30 pm refresh (private repo, cloned with a deploy key)
 sudo tee /etc/systemd/system/nse-tracker.service >/dev/null <<EOF
@@ -204,7 +218,7 @@ fi
 S=/usr/bin/systemctl
 cat <<EOF | sudo tee /etc/sudoers.d/nse-ops >/dev/null
 $USER_NAME ALL=(root) NOPASSWD: $S stop nse-day.service, $S start nse-day.service, $S restart nse-day.service, $S stop nse-day, $S start nse-day, $S restart nse-day
-$USER_NAME ALL=(root) NOPASSWD: $S start nse-update.service, $S start --no-block nse-evening.service, $S start --no-block nse-tracker.service, $S reboot
+$USER_NAME ALL=(root) NOPASSWD: $S start nse-update.service, $S start --no-block nse-evening.service, $S start --no-block nse-tracker.service, $S reboot, $S poweroff
 EOF
 sudo chmod 440 /etc/sudoers.d/nse-ops
 sudo rm -f /etc/sudoers.d/nse-health
@@ -223,7 +237,7 @@ sudo systemctl restart systemd-journald
 
 # 4. Turn everything on
 sudo systemctl daemon-reload
-sudo systemctl enable --now nse-health.timer nse-status.timer nse-update.timer nse-reboot.timer >/dev/null
+sudo systemctl enable --now nse-health.timer nse-status.timer nse-update.timer nse-reboot.timer nse-clean-shutdown.service >/dev/null
 if grep -q '^OPS_BOT_TOKEN=.\+' .env; then sudo systemctl enable nse-opsbot.service >/dev/null; sudo systemctl restart nse-opsbot.service; echo "== ops bot running"; fi
 if [ "${ENABLE_SCANNER:-0}" = "1" ]; then
   sudo systemctl enable --now nse-day.timer nse-evening.timer >/dev/null
