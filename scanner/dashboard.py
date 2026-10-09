@@ -118,6 +118,25 @@ class Live:
 LIVE = None
 
 
+def live_doc_now():
+    """The same snapshot format the website reads from /api/data/live, built from this screen's state."""
+    with LIVE.lock:
+        latest = {f"{s}.NS": {**st, "time": None, "name": None} for s, st in LIVE.state.items() if st.get("price") is not None}
+        for s, st in LIVE.state.items():
+            if st.get("nse_time") and f"{s}.NS" in latest:
+                latest[f"{s}.NS"]["time"] = datetime.strptime(st["nse_time"], "%H:%M:%S").replace(year=2000, tzinfo=S.IST)
+        # the screen's order flow is keyed by bare symbol; the snapshot expects tickers
+        flow = S.Flow()
+        flow.minutes = {(f"{k[0]}.NS", k[1]): v for k, v in LIVE.flow.minutes.items()}
+    doc = S.live_doc(flow, latest, LIVE.info)
+    if STREAM_URL:
+        doc["stream_url"] = STREAM_URL
+    return doc
+
+
+STREAM_URL = ""
+
+
 def publisher(url, every):
     os.environ.setdefault("SUBSCRIBERS_KEY", "local-preview")
     from . import publish
@@ -125,17 +144,8 @@ def publisher(url, every):
     S.LIVE_PUBLISH_SECONDS = every
     while True:
         time.sleep(every)
-        with LIVE.lock:
-            latest = {f"{s}.NS": {**st, "time": None, "name": None} for s, st in LIVE.state.items() if st.get("price") is not None}
-            for s, st in LIVE.state.items():
-                if st.get("nse_time") and f"{s}.NS" in latest:
-                    latest[f"{s}.NS"]["time"] = datetime.strptime(st["nse_time"], "%H:%M:%S").replace(
-                        year=2000, tzinfo=S.IST)
-            # the dashboard's order flow is keyed by bare symbol; the snapshot expects tickers
-            flow = S.Flow()
-            flow.minutes = {(f"{k[0]}.NS", k[1]): v for k, v in LIVE.flow.minutes.items()}
         try:
-            publish.put("live", S.live_doc(flow, latest, LIVE.info))
+            publish.put("live", live_doc_now())
         except Exception as e:
             print("publish failed:", e)
 
@@ -164,6 +174,20 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/remove":
             LIVE.remove(qs.get("s", [""])[0])
             return self._send(200, '{"ok": true}')
+        if u.path == "/live-events":
+            # the website's Live page connects here directly: a full snapshot every second
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                while True:
+                    self.wfile.write(f"data: {json.dumps(live_doc_now(), default=str)}\n\n".encode())
+                    self.wfile.flush()
+                    time.sleep(1)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return
         if u.path == "/events":
             sel = (qs.get("sel", [""])[0] or "").upper()
             self.send_response(200)
@@ -187,6 +211,7 @@ def main():
     p.add_argument("--add", default="", help="extra symbols, comma separated")
     p.add_argument("--publish", default="", help="also post live snapshots to this site, e.g. http://localhost:8888")
     p.add_argument("--every", type=float, default=5, help="seconds between published snapshots")
+    p.add_argument("--stream-url", default="", help="public address of /live-events, told to the website in each snapshot")
     a = p.parse_args()
     today = datetime.now(S.IST).date()
     try:
@@ -200,12 +225,15 @@ def main():
         when = "today" if d == today else (f"{d:%d %b}" if d > today else f"ended {d:%d %b}")
         info[t.replace(".NS", "")] = f"{EVENT_NAMES.get(e['event'], 'lock-in')} · {when}"
     syms = sorted(info) + [x.strip().upper() for x in a.add.split(",") if x.strip()]
+    global STREAM_URL
+    STREAM_URL = a.stream_url or (f"http://localhost:{a.port}/live-events" if a.publish.startswith("http://localhost") else "")
     LIVE = Live(syms, info)
     if a.publish:
         threading.Thread(target=publisher, args=(a.publish, a.every), daemon=True).start()
         print(f"publishing live snapshots to {a.publish} every {a.every:g} s", flush=True)
     print(f"following {len(LIVE.stops)} stocks. Open http://localhost:{a.port}  (Ctrl+C to stop)", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", a.port), Handler).serve_forever()
+    p_host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")   # 0.0.0.0 on a server, behind an HTTPS proxy
+    ThreadingHTTPServer((p_host, a.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
