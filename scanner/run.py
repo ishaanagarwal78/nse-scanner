@@ -384,8 +384,12 @@ if __name__ == "__main__":
     p.add_argument("--backfill")
     p.add_argument("--no-opening", action="store_true", help="later session: skip the overnight digest")
     p.add_argument("--evening", action="store_true", help="evening reports")
+    p.add_argument("--start", default="", help="wait until this time IST (HH:MM) before starting")
     args = p.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
+    if args.start and not args.backfill:
+        print(f"waiting until {args.start} IST", flush=True)
+        wait_until(args.start)
     if args.evening:
         evening()
     elif args.backfill:

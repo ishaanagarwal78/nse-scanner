@@ -1,4 +1,5 @@
 name: Market-hours scanner
+run-name: ${{ github.event.inputs.slot || (github.event.schedule == '55 2 * * 1-5' && 'morning') || (github.event.schedule == '25 7 * * 1-5' && 'afternoon') || (github.event.schedule == '45 13 * * 1-5' && 'evening') || github.event.inputs.mode }}
 
 on:
   schedule:
@@ -8,10 +9,16 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "session, backfill or evening"
+        description: "session, backfill, evening or relay"
         default: backfill
+      slot:
+        description: "morning, afternoon, evening or relay (used by the run chain; leave empty for a one-off run)"
+        default: ""
       date:
         description: "backfill date (YYYY-MM-DD or YYYY-MM-DD:YYYY-MM-DD)"
+        default: ""
+      start:
+        description: "wait until this time IST before starting (HH:MM)"
         default: ""
       until:
         description: "session end time IST (HH:MM)"
@@ -21,8 +28,12 @@ on:
         default: "no"
 
 concurrency:
-  group: scanner-${{ github.event.schedule || github.event.inputs.mode }}
+  group: scanner-${{ github.event.inputs.slot || (github.event.schedule == '55 2 * * 1-5' && 'morning') || (github.event.schedule == '25 7 * * 1-5' && 'afternoon') || (github.event.schedule == '45 13 * * 1-5' && 'evening') || github.event.inputs.mode }}
   cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   scan:
@@ -35,6 +46,9 @@ jobs:
       ALERTS_LIVE: ${{ vars.ALERTS_LIVE }}
       PRICE_ALERTS_LIVE: ${{ vars.PRICE_ALERTS_LIVE }}
       PREVIEW_CHAT: ${{ vars.PREVIEW_CHAT }}
+      GITHUB_TOKEN: ${{ github.token }}
+      SLOT: ${{ github.event.inputs.slot || (github.event.schedule == '55 2 * * 1-5' && 'morning') || (github.event.schedule == '25 7 * * 1-5' && 'afternoon') || (github.event.schedule == '45 13 * * 1-5' && 'evening') || '' }}
+      START: ${{ github.event.inputs.start }}
       PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
@@ -43,29 +57,39 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Skip if this slot already ran today
+        id: guard
+        if: env.SLOT != '' && env.SLOT != 'relay'
+        run: python -m scanner.chain done "$SLOT" && echo "go=1" >> "$GITHUB_OUTPUT" || echo "go=0" >> "$GITHUB_OUTPUT"
       - name: Morning session
-        if: github.event.schedule == '55 2 * * 1-5'
-        run: python -m scanner.run --until 13:00
+        if: env.SLOT == 'morning' && steps.guard.outputs.go == '1'
+        run: python -m scanner.run --start "${START:-08:25}" --until 13:00
       - name: Afternoon session
-        if: github.event.schedule == '25 7 * * 1-5'
-        run: python -m scanner.run --until 18:50 --no-opening
+        if: env.SLOT == 'afternoon' && steps.guard.outputs.go == '1'
+        run: python -m scanner.run --start "${START:-12:55}" --until 18:50 --no-opening
       - name: Evening reports
-        if: github.event.schedule == '45 13 * * 1-5'
-        run: python -m scanner.run --evening
-      - name: Manual run
-        if: github.event_name == 'workflow_dispatch'
+        if: env.SLOT == 'evening' && steps.guard.outputs.go == '1'
+        run: python -m scanner.run --start "${START:-19:15}" --evening
+      - name: Relay toward the next morning
+        if: env.SLOT == 'relay'
+        run: python -m scanner.chain relay
+      - name: One-off manual run
+        if: github.event_name == 'workflow_dispatch' && env.SLOT == ''
         run: |
           if [ "${{ github.event.inputs.mode }}" = "session" ]; then
             if [ "${{ github.event.inputs.opening }}" = "yes" ]; then
-              python -m scanner.run --until "${{ github.event.inputs.until }}"
+              python -m scanner.run --start "${START:-00:00}" --until "${{ github.event.inputs.until }}"
             else
-              python -m scanner.run --until "${{ github.event.inputs.until }}" --no-opening
+              python -m scanner.run --start "${START:-00:00}" --until "${{ github.event.inputs.until }}" --no-opening
             fi
           elif [ "${{ github.event.inputs.mode }}" = "evening" ]; then
             python -m scanner.run --evening
           else
             python -m scanner.run --backfill "${{ github.event.inputs.date || '2026-10-08' }}"
           fi
+      - name: Start the next run
+        if: always() && env.SLOT != '' && env.SLOT != 'relay'
+        run: python -m scanner.chain next "$SLOT"
       - name: Keep the day's price data
         if: always() && hashFiles('stream_data/*') != ''
         uses: actions/upload-artifact@v4
