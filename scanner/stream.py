@@ -522,9 +522,10 @@ class Flow:
 LIVE_PUBLISH_SECONDS = float(os.environ.get("LIVE_PUBLISH_SECONDS", "60"))
 LIVE_SERVER_PORT = int(os.environ.get("LIVE_SERVER_PORT", "0") or 0)    # e.g. 8765 on the Raspberry Pi
 LIVE_STREAM_URL = os.environ.get("LIVE_STREAM_URL", "")                 # public https address of /live-events
+CLIENTS = [0]                                                           # website viewers connected right now
 
 
-def serve_live(port, build):
+def serve_live(port, build, info=lambda: {}):
     """Serve /live-events: a full live snapshot every second, for the website's Live page (CORS open)."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -533,16 +534,23 @@ def serve_live(port, build):
             pass
 
         def do_GET(self):
-            if not self.path.startswith("/live-events"):
-                self.send_response(404 if self.path != "/health" else 200)
+            if self.path.startswith("/health"):
+                body = json.dumps({"ok": True, "viewers": CLIENTS[0], **info()}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b"ok" if self.path == "/health" else b"")
+                self.wfile.write(body)
+                return
+            if not self.path.startswith("/live-events"):
+                self.send_response(404)
+                self.end_headers()
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
+            CLIENTS[0] += 1
             try:
                 while True:
                     doc = build()
@@ -552,6 +560,8 @@ def serve_live(port, build):
                     time.sleep(1)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                 return
+            finally:
+                CLIENTS[0] -= 1
 
     srv = ThreadingHTTPServer(("0.0.0.0", port), H)
     srv.daemon_threads = True
@@ -654,7 +664,9 @@ def run(until, send, opening=True, stop=None):
                 time.sleep(0.05)
         return None
 
-    server = serve_live(LIVE_SERVER_PORT, build_now) if LIVE_SERVER_PORT else None
+    server = serve_live(LIVE_SERVER_PORT, build_now, lambda: {
+        "nse_connected": len(stats["connected"]), "nse_messages": stats["data"], "nse_drops": stats["drops"],
+        "followed": len(focus)}) if LIVE_SERVER_PORT else None
     for t in watchers:
         notes.setdefault(t.replace(".NS", ""), "on a watchlist")
     follow_syms = {t.replace(".NS", "") for t in set(focus) | set(every)}
@@ -682,6 +694,8 @@ def run(until, send, opening=True, stop=None):
             snap = preopen.rows(preopen.fetch(ex.nse))
         except Exception as e:
             print("pre-open fetch failed:", e)
+            from . import ops
+            ops.alert(f"NSE pre-open data failed: {e}", key="preopen")
             snap = None
         if snap:
             pre_snaps.append((label, snap))
@@ -700,6 +714,11 @@ def run(until, send, opening=True, stop=None):
         preopen.save(OUT, day, pre_snaps, follow_syms)
         final = pre_snaps[-1][1] if pre_snaps else {}
         print(f"pre-open: {len(final)} stocks recorded, {len(pre_snaps)} snapshots", flush=True)
+        from . import ops
+        if final:
+            ops.mark("preopen")
+        else:
+            ops.alert("NSE pre-open: no data recorded this morning.", key="preopen-empty")
         if not opening or hms >= "09:20:00":
             return
         for t in focus:

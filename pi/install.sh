@@ -26,6 +26,7 @@ chmod 600 .env
 sudo tee /etc/systemd/system/nse-day.service >/dev/null <<EOF
 [Unit]
 Description=NSE scanner, market hours (8:30 brief, pre-open, live stream, news, insiders)
+OnFailure=nse-notify@%n.service
 After=network-online.target time-sync.target
 Wants=network-online.target
 [Service]
@@ -53,6 +54,7 @@ EOF
 sudo tee /etc/systemd/system/nse-evening.service >/dev/null <<EOF
 [Unit]
 Description=NSE evening reports (money flows, insiders, shareholding)
+OnFailure=nse-notify@%n.service
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -145,16 +147,48 @@ Description=Weekly reboot
 Type=oneshot
 ExecStart=/usr/bin/systemctl reboot
 EOF
-# the health check may stop/start the market-hours service on overheating, without a password
-echo "$USER_NAME ALL=(root) NOPASSWD: /usr/bin/systemctl stop nse-day.service, /usr/bin/systemctl start nse-day.service, /usr/bin/systemctl stop nse-day, /usr/bin/systemctl start nse-day" \
-  | sudo tee /etc/sudoers.d/nse-health >/dev/null
-sudo chmod 440 /etc/sudoers.d/nse-health
+sudo tee /etc/systemd/system/nse-opsbot.service >/dev/null <<EOF
+[Unit]
+Description=Ops bot: Pi controls and technical alerts on Telegram
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=$USER_NAME
+WorkingDirectory=$APP
+EnvironmentFile=$APP/.env
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=$APP/.venv/bin/python pi/opsbot.py
+Restart=always
+RestartSec=15
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo tee /etc/systemd/system/nse-notify@.service >/dev/null <<EOF
+[Unit]
+Description=Tell the ops bot that %i failed
+[Service]
+Type=oneshot
+User=$USER_NAME
+WorkingDirectory=$APP
+EnvironmentFile=$APP/.env
+ExecStart=$APP/.venv/bin/python pi/notify.py %i
+EOF
+# the ops bot and health check may control these services without a password (nothing else)
+S=/usr/bin/systemctl
+cat <<EOF | sudo tee /etc/sudoers.d/nse-ops >/dev/null
+$USER_NAME ALL=(root) NOPASSWD: $S stop nse-day.service, $S start nse-day.service, $S restart nse-day.service, $S stop nse-day, $S start nse-day, $S restart nse-day
+$USER_NAME ALL=(root) NOPASSWD: $S start nse-update.service, $S start --no-block nse-evening.service, $S reboot
+EOF
+sudo chmod 440 /etc/sudoers.d/nse-ops
+sudo rm -f /etc/sudoers.d/nse-health
+sudo visudo -cq || { echo "sudoers check failed"; sudo rm -f /etc/sudoers.d/nse-ops; exit 1; }
 
 # 3. Protection: hardware watchdog, logs in memory, automatic security updates, timezone
 sudo mkdir -p /etc/systemd/system.conf.d /etc/systemd/journald.conf.d
 printf '[Manager]\nRuntimeWatchdogSec=15\nRebootWatchdogSec=2min\n' | sudo tee /etc/systemd/system.conf.d/watchdog.conf >/dev/null
 printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=40M\n' | sudo tee /etc/systemd/journald.conf.d/ram.conf >/dev/null
 sudo timedatectl set-timezone Asia/Kolkata
+sudo usermod -aG gpio "$USER_NAME" 2>/dev/null || true
 sudo apt-get install -y -q unattended-upgrades >/dev/null
 printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' | sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
 sudo systemctl daemon-reexec
@@ -163,6 +197,7 @@ sudo systemctl restart systemd-journald
 # 4. Turn everything on
 sudo systemctl daemon-reload
 sudo systemctl enable --now nse-health.timer nse-status.timer nse-update.timer nse-reboot.timer >/dev/null
+if grep -q '^OPS_BOT_TOKEN=.\+' .env; then sudo systemctl enable nse-opsbot.service >/dev/null; sudo systemctl restart nse-opsbot.service; echo "== ops bot running"; fi
 if [ "${ENABLE_SCANNER:-0}" = "1" ]; then
   sudo systemctl enable --now nse-day.timer nse-evening.timer >/dev/null
   echo "== scanner timers ON"

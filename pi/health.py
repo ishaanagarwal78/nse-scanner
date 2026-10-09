@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 IST = timezone(timedelta(hours=5, minutes=30))
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TOKEN = os.environ.get("OPS_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OWNER = os.environ.get("OWNER_CHAT", "") or os.environ.get("PREVIEW_CHAT", "")
 STATE = os.path.expanduser("~/.nse-health.json")
 WARN_C, STOP_C, RESUME_C = 70.0, 82.0, 65.0
@@ -107,11 +107,53 @@ def main(daily=False):
         problems.append(f"💾 Storage almost full: {disk_free:.0f}% free.")
     if avail is not None and avail < 80:
         problems.append(f"🧠 Low memory: {avail} MB free.")
-    if market_hours(now) and now.strftime("%H:%M") >= "08:35" and not day_active and not st.get("heat_stopped"):
+    try:
+        requests.get("https://www.google.com/generate_204", timeout=8)
+        net_ok = True
+    except Exception:
+        net_ok = False
+    if not net_ok:
+        st["net_down"] = st.get("net_down", 0) + 1
+        if st["net_down"] == 2:   # two checks in a row (10 minutes): alert once the line is back, via the queue below
+            st["net_down_since"] = now.strftime("%H:%M")
+    elif st.get("net_down", 0) >= 2:
+        problems.append(f"🌐 Internet was down from about {st.get('net_down_since', '?')} until {now:%H:%M}.")
+        st["net_down"] = 0
+    else:
+        st["net_down"] = 0
+    if net_ok and day_active and now.weekday() < 5 and "09:20" <= now.strftime("%H:%M") <= "15:25":
+        try:
+            h = requests.get("http://127.0.0.1:8765/health", timeout=4).json()
+            if h.get("followed") and h.get("nse_connected", 0) < h["followed"] * 0.5:
+                problems.append(f"📡 Only {h.get('nse_connected')} of {h['followed']} NSE live connections are up "
+                                f"({h.get('nse_drops')} drops). NSE may be limiting this connection.")
+        except Exception:
+            problems.append("📡 The live stream server is not answering.")
+    # missed schedules (weekdays), only once the Pi is the main scanner: each step marks itself done in ~/.nse-ops.json
+    scanner_on = sh("systemctl", "is-enabled", "nse-day.timer") == "enabled"
+    if now.weekday() < 5 and scanner_on:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from scanner import ops
+        hm = now.strftime("%H:%M")
+        for name, by, what in (("brief", "08:45", "the 8:30 brief"), ("preopen", "09:20", "the pre-open capture"),
+                               ("evening", "19:50", "the 7:15 pm evening reports")):
+            if hm >= by and not ops.marked_today(name) and not (name != "evening" and hm > "18:50"):
+                problems.append(f"⏰ Missed: {what} had not run by {by}.")
+    if now.weekday() < 5:
+        hm = now.strftime("%H:%M")
+        if hm >= "20:15":
+            try:
+                s = requests.get(os.environ.get("DASHBOARD_URL", "https://nse-lockin-tracker.netlify.app").rstrip("/")
+                                 + "/api/data/status", timeout=20).json()
+                if str(s.get("generated_at", ""))[:10] != now.date().isoformat():
+                    problems.append(f"⏰ Missed: the 7:30 pm lock-in data refresh. Last one was {str(s.get('generated_at', '?'))[:16]}.")
+            except Exception as e:
+                problems.append(f"🌐 Could not check the website's data: {e}")
+    if scanner_on and market_hours(now) and now.strftime("%H:%M") >= "08:35" and not day_active and not st.get("heat_stopped"):
         problems.append("⚠️ The market-hours scanner is not running. Run: sudo systemctl start nse-day")
 
     sent = st.get("sent", {})
-    fresh = [p for p in problems if time.time() - sent.get(p[:40], 0) > 3600]
+    fresh = [p for p in problems if time.time() - sent.get(p[:40], 0) > (10800 if p.startswith("⏰") else 3600)]
     if fresh:
         send("🍓 <b>Pi health</b>\n" + "\n".join(fresh))
         for p in fresh:

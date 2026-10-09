@@ -35,11 +35,16 @@ def put(name, doc):
         if r.status_code != 200 and name not in _warned:
             _warned.add(name)
             print(f"publish {name}: HTTP {r.status_code} {r.text[:80]} (the site may need the new data name deployed)")
+            if r.status_code != 404:   # 404 only means the site has not been deployed with this data name yet
+                from . import ops
+                ops.alert(f"Uploading '{name}' to the website failed: HTTP {r.status_code}", key=f"pub-{name}", every=6 * 3600)
         return r.status_code == 200
     except Exception as e:
         if name not in _warned:
             _warned.add(name)
             print(f"publish {name} failed: {e}")
+            from . import ops
+            ops.alert(f"Uploading '{name}' to the website failed: {e}", key=f"pub-{name}", every=6 * 3600)
         return False
 
 

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from curl_cffi import requests as cffi
 
+from . import ops
 from .rules import amount_crore, classify, size_order
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -271,6 +272,7 @@ def session(until, opening=True, catchup_minutes=3):
     feed.start()
     seen, pending, sent_keys, ins_seen = set(), [], set(), set()
     first, first_ins, last_ins = True, True, 0.0
+    ann_streak = ops.Streak("NSE company announcements", 3)
     sent_digests = set()
     while True:
         now = datetime.now(IST)
@@ -280,8 +282,10 @@ def session(until, opening=True, catchup_minutes=3):
             raw = nse.announcements(now)
         except Exception as e:
             print("fetch failed:", e)
+            ann_streak.fail(e)
             time.sleep(POLL_SECONDS)
             continue
+        ann_streak.ok()
         fresh = [a for a in raw if (a.get("seq_id") or a.get("an_dt")) not in seen]
         for a in fresh:
             seen.add(a.get("seq_id") or a.get("an_dt"))
@@ -297,8 +301,10 @@ def session(until, opening=True, catchup_minutes=3):
                 b = brief.build(nse, now, cal, nse.mcap or load_market_caps(), early, tracked, esc, crore, SITE)
                 for c in everyone:
                     send(c["id"], b, "new")
+                ops.mark("brief")
             except Exception as ex:
                 print("brief failed:", ex)
+                ops.alert(f"The 8:30 brief failed: {ex}", key="brief")
             if early:
                 msg = digest(early, "Before the open: company news overnight")
                 for c in people:
@@ -334,6 +340,7 @@ def session(until, opening=True, catchup_minutes=3):
                             send(c["id"], insider.fmt(t, mcap, esc, crore), "new")
             except Exception as ex:
                 print("insider check failed:", ex)
+                ops.alert(f"Insider-trade check failed: {ex}", key="insider")
             first_ins = False
         hhmm = now.strftime("%H:%M")
         for dt_ in DIGEST_TIMES:
@@ -397,10 +404,12 @@ def evening():
         publish.insiders(trades, holders, day, caps)
     except Exception as ex:
         print("insider data failed:", ex)
+        ops.alert(f"Evening insider data failed: {ex}", key="ev-insider")
     try:
         publish.flows(flows.data(nse, day))
     except Exception as ex:
         print("flows data failed:", ex)
+        ops.alert(f"Evening money-flow data failed: {ex}", key="ev-flows")
     jobs = [("money flows", lambda: flows.report(nse, day, esc), everyone),
             ("insiders", lambda: insider.digest(trades, holders, caps, esc, crore,
                                                 f"Insider and big-holder trades, {day:%d %b}"), people),
@@ -411,6 +420,7 @@ def evening():
             msg = build()
         except Exception as ex:
             print(f"{name} failed:", ex)
+            ops.alert(f"Evening report '{name}' failed: {ex}", key=f"ev-{name}")
             continue
         if not msg:
             print(f"{name}: nothing notable today")
@@ -418,6 +428,7 @@ def evening():
         print(f"{name}:\n{msg['text']}\n")
         for c in to:
             send(c["id"], msg, "new")
+    ops.mark("evening")
 
 
 if __name__ == "__main__":
