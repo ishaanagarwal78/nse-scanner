@@ -252,7 +252,7 @@ def wait_until(hhmm):
         time.sleep(20)
 
 
-def session(until, opening=True, catchup_minutes=10):
+def session(until, opening=True, catchup_minutes=3):
     from . import brief, insider, stream
     nse = NSE()
     people = chats()

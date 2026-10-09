@@ -66,7 +66,7 @@ jobs:
         run: python -m scanner.run --start "${START:-08:25}" --until 13:00
       - name: Afternoon session
         if: env.SLOT == 'afternoon' && steps.guard.outputs.go == '1'
-        run: python -m scanner.run --start "${START:-12:55}" --until 18:50 --no-opening
+        run: python -m scanner.run --start "${START:-13:00}" --until 18:50 --no-opening
       - name: Evening reports
         if: env.SLOT == 'evening' && steps.guard.outputs.go == '1'
         run: python -m scanner.run --start "${START:-19:15}" --evening

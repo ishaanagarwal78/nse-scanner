@@ -24,7 +24,7 @@ RUN_ID = int(os.environ.get("GITHUB_RUN_ID", "0") or 0)
 
 SLOTS = {
     "morning": {"mode": "session", "slot": "morning", "start": "08:25", "until": "13:00", "opening": "yes"},
-    "afternoon": {"mode": "session", "slot": "afternoon", "start": "12:58", "until": "18:50", "opening": "no"},
+    "afternoon": {"mode": "session", "slot": "afternoon", "start": "13:00", "until": "18:50", "opening": "no"},
     "evening": {"mode": "evening", "slot": "evening", "start": "19:15"},
     "relay": {"mode": "relay", "slot": "relay"},
 }
@@ -53,7 +53,7 @@ def dispatch(slot):
 
 
 def next_morning(now):
-    d = now.date() + timedelta(days=0 if now.strftime("%H:%M") < "08:20" else 1)
+    d = now.date() + timedelta(days=0 if now.strftime("%H:%M") < "08:25" else 1)
     while d.weekday() >= 5:
         d += timedelta(days=1)
     return datetime(d.year, d.month, d.day, 8, 25, tzinfo=IST)
