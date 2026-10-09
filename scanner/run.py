@@ -262,6 +262,8 @@ def session(until, opening=True, catchup_minutes=3):
         unlocks = stream.targets(datetime.now(IST).date())[0]
     except Exception:
         unlocks = {}
+    if opening and datetime.now(IST).strftime("%H:%M") > "09:10":
+        opening = False   # started late (restart or power cut): no "before the open" messages mid-morning
     if opening:
         wait_until("08:30")
     # Live prices run alongside in their own thread (NSE push stream, polling fallback, pre-open, Yahoo bars)
