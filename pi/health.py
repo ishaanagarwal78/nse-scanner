@@ -74,7 +74,7 @@ def load():
 
 
 def market_hours(now):
-    return now.weekday() < 5 and "08:25" <= now.strftime("%H:%M") <= "18:50"
+    return now.weekday() < 5 and "08:25" <= now.strftime("%H:%M") < "18:50"   # the scanner stops at 18:50
 
 
 def main(daily=False):
@@ -142,13 +142,16 @@ def main(daily=False):
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from scanner import ops
         hm = now.strftime("%H:%M")
-        for name, by, what in (("brief", "08:45", "the 8:30 brief"), ("preopen", "09:20", "the pre-open capture"),
-                               ("evening", "19:50", "the 7:15 pm evening reports")):
-            if hm >= by and not ops.marked_today(name) and not (name != "evening" and hm > "18:50"):
+        # each check only runs in a short window after its deadline, so a late start or a reboot in the
+        # afternoon does not report the morning's steps hours later
+        for name, by, upto, what in (("brief", "08:45", "10:00", "the 8:30 brief"),
+                                     ("preopen", "09:20", "10:00", "the pre-open capture"),
+                                     ("evening", "19:50", "22:00", "the 7:15 pm evening reports")):
+            if by <= hm < upto and not ops.marked_today(name):
                 problems.append(f"⏰ Missed: {what} had not run by {by}.")
     if now.weekday() < 5:
         hm = now.strftime("%H:%M")
-        if hm >= "20:15":
+        if "20:15" <= hm < "23:00":
             try:
                 s = requests.get(os.environ.get("DASHBOARD_URL", "https://nse-lockin-tracker.netlify.app").rstrip("/")
                                  + "/api/data/status", timeout=20).json()
