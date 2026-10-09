@@ -162,6 +162,16 @@ def main(daily=False):
     if scanner_on and market_hours(now) and now.strftime("%H:%M") >= "08:35" and not day_active and not st.get("heat_stopped"):
         problems.append("⚠️ The market-hours scanner is not running. Run: sudo systemctl start nse-day")
 
+    # heartbeat for the website's pi-watch job, which alerts through the ops bot if the Pi goes quiet
+    if net_ok and (now.minute % 15 < 5 or daily):
+        try:
+            requests.post(os.environ.get("DASHBOARD_URL", "https://nse-lockin-tracker.netlify.app").rstrip("/")
+                          + "/api/data/heartbeat", timeout=20,
+                          headers={"x-tracker-key": os.environ.get("SUBSCRIBERS_KEY", "")},
+                          json={"at": now.isoformat(timespec="seconds"), "temp": t, "scanner": day_active})
+        except Exception as e:
+            print("heartbeat failed:", e)
+
     sent = st.get("sent", {})
     fresh = [p for p in problems if time.time() - sent.get(p[:40], 0) > (10800 if p.startswith("⏰") else 3600)]
     if fresh:
