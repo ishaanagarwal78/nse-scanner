@@ -98,7 +98,8 @@ const big = (x) => x == null ? "–" : x >= 1e7 ? (x / 1e7).toFixed(2) + " cr" :
 const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 let sel = new URLSearchParams(location.search).get("s") || "";
-let sortK = "chg", sortDir = 1, es = null, order = [];
+let sortK = "chg", sortDir = 1, es = null, order = [], lastSort = 0, resortNow = true;
+const RESORT_MS = 10000;   // rows keep their places between re-sorts, so the table stays still while you read it
 const rowEls = new Map();           // symbol -> { tr, cells, price }
 
 // ---------- small helpers: set only what changed, soft highlight, number tweens ----------
@@ -188,7 +189,10 @@ function render(d) {
     if (x == null) return 1; if (y == null) return -1;
     return (x > y ? 1 : x < y ? -1 : (a.symbol < b.symbol ? -1 : 1)) * (typeof x === "string" ? sortDir : -sortDir);
   }).map((r) => r.symbol);
-  if (next.join() !== order.join()) reorder(body, next);
+  const due = resortNow || performance.now() - lastSort > RESORT_MS;
+  const fresh = d.rows.some((r) => !order.includes(r.symbol)) || order.some((s) => !rowEls.has(s));
+  if ((due || fresh) && next.join() !== order.join()) { reorder(body, next); }
+  if (due) { lastSort = performance.now(); resortNow = false; }
   if (d.detail) renderDetail(d.detail, d.rows.find((r) => r.symbol === sel));
 }
 
@@ -330,7 +334,7 @@ $("rows").addEventListener("click", (e) => {
 });
 $("rows").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.closest("tr.row")?.click(); });
 document.querySelectorAll("th[data-k]").forEach((th) => th.addEventListener("click", () => {
-  sortDir = sortK === th.dataset.k ? -sortDir : 1; sortK = th.dataset.k;
+  sortDir = sortK === th.dataset.k ? -sortDir : 1; sortK = th.dataset.k; resortNow = true;
   document.querySelectorAll("th[data-k]").forEach((x) => x.classList.toggle("on", x === th));
 }));
 $("add").addEventListener("submit", async (e) => {
