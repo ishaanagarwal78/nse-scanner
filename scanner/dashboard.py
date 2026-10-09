@@ -118,6 +118,28 @@ class Live:
 LIVE = None
 
 
+def publisher(url, every):
+    os.environ.setdefault("SUBSCRIBERS_KEY", "local-preview")
+    from . import publish
+    publish.SITE, publish.KEY = url.rstrip("/"), os.environ["SUBSCRIBERS_KEY"]
+    S.LIVE_PUBLISH_SECONDS = every
+    while True:
+        time.sleep(every)
+        with LIVE.lock:
+            latest = {f"{s}.NS": {**st, "time": None, "name": None} for s, st in LIVE.state.items() if st.get("price") is not None}
+            for s, st in LIVE.state.items():
+                if st.get("nse_time") and f"{s}.NS" in latest:
+                    latest[f"{s}.NS"]["time"] = datetime.strptime(st["nse_time"], "%H:%M:%S").replace(
+                        year=2000, tzinfo=S.IST)
+            # the dashboard's order flow is keyed by bare symbol; the snapshot expects tickers
+            flow = S.Flow()
+            flow.minutes = {(f"{k[0]}.NS", k[1]): v for k, v in LIVE.flow.minutes.items()}
+        try:
+            publish.put("live", S.live_doc(flow, latest, LIVE.info))
+        except Exception as e:
+            print("publish failed:", e)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -163,6 +185,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--add", default="", help="extra symbols, comma separated")
+    p.add_argument("--publish", default="", help="also post live snapshots to this site, e.g. http://localhost:8888")
+    p.add_argument("--every", type=float, default=5, help="seconds between published snapshots")
     a = p.parse_args()
     today = datetime.now(S.IST).date()
     try:
@@ -177,6 +201,9 @@ def main():
         info[t.replace(".NS", "")] = f"{EVENT_NAMES.get(e['event'], 'lock-in')} · {when}"
     syms = sorted(info) + [x.strip().upper() for x in a.add.split(",") if x.strip()]
     LIVE = Live(syms, info)
+    if a.publish:
+        threading.Thread(target=publisher, args=(a.publish, a.every), daemon=True).start()
+        print(f"publishing live snapshots to {a.publish} every {a.every:g} s", flush=True)
     print(f"following {len(LIVE.stops)} stocks. Open http://localhost:{a.port}  (Ctrl+C to stop)", flush=True)
     ThreadingHTTPServer(("127.0.0.1", a.port), Handler).serve_forever()
 

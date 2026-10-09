@@ -12,6 +12,7 @@ Rules (no AI):
   - Promoter selling in the open market worth ₹1 cr or more: instant for watchlist and unlock-week stocks.
   - Everything else of note goes into the evening digest.
 """
+import html
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -34,7 +35,7 @@ def parse_xbrl(xml):
     """One filing -> list of trades (one per person/disclosure context)."""
     ctx = {}
     for name, ref, val in TAG.findall(xml):
-        ctx.setdefault(ref, {})[name] = val.strip()
+        ctx.setdefault(ref, {})[name] = html.unescape(val.strip())
     main = ctx.get("MainI", {})
     out = []
     for ref, f in ctx.items():
@@ -175,7 +176,7 @@ def big_holders(nse, day):
             kind = "big holder sold in the market"
         else:
             continue
-        out.append({"symbol": r["symbol"], "company": r.get("company"), "who": r.get("acquirerName"), "after": after,
+        out.append({"symbol": r["symbol"], "company": html.unescape(r.get("company") or ""), "who": html.unescape(r.get("acquirerName") or ""), "after": after,
                     "kind": kind})
     seen, uniq = set(), []
     for x in out:

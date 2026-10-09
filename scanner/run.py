@@ -320,7 +320,11 @@ def session(until, opening=True, catchup_minutes=3):
             last_ins = time.time()
             try:
                 since = now - timedelta(minutes=catchup_minutes) if first_ins and not opening else None
-                for t in insider.fetch(nse, now, ins_seen, since):
+                found = insider.fetch(nse, now, ins_seen, since)
+                if found:
+                    from . import publish
+                    publish.insiders(found, [], now, nse.mcap)
+                for t in found:
                     mcap = nse.market_cap(t["symbol"])
                     for c in people:
                         watched = f"{t['symbol']}.NS" in (c.get("watch") or [])
@@ -348,6 +352,31 @@ def session(until, opening=True, catchup_minutes=3):
     print("session finished")
 
 
+def seed_site(days):
+    """Fill the site's insider history and money flows from past NSE filings (one-off, or after a gap)."""
+    from . import flows, insider, publish
+    nse = NSE()
+    caps = nse.mcap = load_market_caps()
+    end = datetime.now(IST)
+    d = end - timedelta(days=days)
+    while d.date() <= end.date():
+        if d.weekday() < 5:
+            try:
+                t, h = insider.fetch(nse, d), insider.big_holders(nse, d)
+                publish.insiders(t, h, d, caps, keep_days=days + 1)
+                print(f"{d:%d %b}: {len(t)} insider trades, {len(h)} big-holder changes")
+            except Exception as ex:
+                print(f"{d:%d %b}: failed ({ex})")
+            time.sleep(2)
+        d += timedelta(days=1)
+    for back in range(0, 6):   # the most recent day with published end-of-day data
+        day = end - timedelta(days=back)
+        if day.weekday() < 5 and flows.participant_oi(nse, day):
+            doc = publish.flows(flows.data(nse, day))
+            print(f"money flows published for {day:%d %b}: FII net {(doc.get('fii') or {}).get('net')}")
+            break
+
+
 def evening():
     """Evening reports (about 7:15 pm): money flows, insider and big-holder trades, shareholding shifts."""
     from . import flows, holdings, insider
@@ -359,8 +388,19 @@ def evening():
     if day.weekday() >= 5:
         print("weekend: nothing to report")
         return
+    from . import publish
+    trades, holders = [], []
+    try:
+        trades, holders = insider.fetch(nse, day), insider.big_holders(nse, day)
+        publish.insiders(trades, holders, day, caps)
+    except Exception as ex:
+        print("insider data failed:", ex)
+    try:
+        publish.flows(flows.data(nse, day))
+    except Exception as ex:
+        print("flows data failed:", ex)
     jobs = [("money flows", lambda: flows.report(nse, day, esc), everyone),
-            ("insiders", lambda: insider.digest(insider.fetch(nse, day), insider.big_holders(nse, day), caps, esc, crore,
+            ("insiders", lambda: insider.digest(trades, holders, caps, esc, crore,
                                                 f"Insider and big-holder trades, {day:%d %b}"), people),
             ("shareholding", lambda: holdings.digest(holdings.shifts(nse, day, caps), esc, crore,
                                                      f"Shareholding shifts, {day:%d %b}"), people)]
@@ -385,12 +425,16 @@ if __name__ == "__main__":
     p.add_argument("--no-opening", action="store_true", help="later session: skip the overnight digest")
     p.add_argument("--evening", action="store_true", help="evening reports")
     p.add_argument("--start", default="", help="wait until this time IST (HH:MM) before starting")
+    p.add_argument("--seed-site", type=int, default=0, metavar="DAYS",
+                   help="publish insider trades for the last DAYS days and the latest money flows, then exit")
     args = p.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     if args.start and not args.backfill:
         print(f"waiting until {args.start} IST", flush=True)
         wait_until(args.start)
-    if args.evening:
+    if args.seed_site:
+        seed_site(args.seed_site)
+    elif args.evening:
         evening()
     elif args.backfill:
         a, _, b = args.backfill.partition(":")

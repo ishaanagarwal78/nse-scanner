@@ -518,6 +518,45 @@ class Flow:
             w.writerows(self.depth_rows)
 
 
+# ---------- live snapshot for the website and bot (/api/data/live) ----------
+LIVE_PUBLISH_SECONDS = float(os.environ.get("LIVE_PUBLISH_SECONDS", "60"))
+
+
+def live_doc(flow, latest, notes, market=None, now=None):
+    """Compact snapshot: latest quote, order book and the last 30 minutes of order flow for every followed stock."""
+    now = now or datetime.now(IST)
+    stocks = []
+    for t, q in sorted(latest.items()):
+        sym = t.replace(".NS", "")
+        buy, sell, tb, ts = flow.recent(t, now, 15)
+        mins = []
+        for k in range(29, -1, -1):
+            mm = (now.replace(second=0, microsecond=0) - timedelta(minutes=k)).strftime("%H:%M")
+            m = flow.minutes.get((t, mm))
+            if m:
+                mins.append([mm, round(m[0]), round(m[1]), m[6]])
+        d = q.get("depth") or {}
+        stocks.append({"symbol": sym, "note": notes.get(sym, ""), "name": q.get("name"), "price": q["price"],
+                       "chg": round(q["chg"], 2) if q.get("chg") is not None else None, "volume": q.get("volume"),
+                       "bid": q.get("bid"), "ask": q.get("ask"), "bids": d.get("bids") or [], "asks": d.get("asks") or [],
+                       "wait_buy": d.get("tot_buy"), "wait_sell": d.get("tot_sell"), "buy15": round(buy), "sell15": round(sell),
+                       "nse_time": q["time"].strftime("%H:%M:%S") if q.get("time") else None, "minutes": mins})
+    open_ = now.weekday() < 5 and "09:15" <= now.strftime("%H:%M") <= "15:30"
+    return {"generated_at": now.isoformat(timespec="seconds"), "market_open": open_, "nifty_chg": market,
+            "every_seconds": LIVE_PUBLISH_SECONDS, "stocks": stocks}
+
+
+def lockin_notes(near, today):
+    names = {"preipo_6m": "6-month lock-in", "anchor_30d": "anchor lock-in (half)", "anchor_90d": "anchor lock-in (rest)",
+             "promoter_18m": "promoter lock-in"}
+    out = {}
+    for t, e in near.items():
+        d = datetime.fromisoformat(e["free_day"]).date()
+        when = "today" if d == today else (f"{d:%d %b}" if d > today else f"ended {d:%d %b}")
+        out[t.replace(".NS", "")] = f"{names.get(e['event'], 'lock-in')} · {when}"
+    return out
+
+
 # ---------- the loop ----------
 def run(until, send, opening=True, stop=None):
     import queue
@@ -564,6 +603,9 @@ def run(until, send, opening=True, stop=None):
     last_fast, market, traded, last_stream, stream_age = {}, None, set(), {}, []
     i, last_poll, last_report, last_save, last_mkt = 0, 0.0, 0.0, time.time(), 0.0
     pre_snaps, pre_done = [], set()
+    latest, notes, last_pub = {}, lockin_notes(near, today), 0.0
+    for t in watchers:
+        notes.setdefault(t.replace(".NS", ""), "on a watchlist")
     follow_syms = {t.replace(".NS", "") for t in set(focus) | set(every)}
 
     def handle(t, q, now):
@@ -576,6 +618,7 @@ def run(until, send, opening=True, stop=None):
                 feed.age.append((now - q["time"]).total_seconds())
         if q["source"].startswith("NSE"):
             flow.update(t, q, now)
+            latest[t] = {**q, "name": q.get("name") or ex.names.get(t.replace(".NS", ""))}
         if (q["time"] and q["time"].date() == today) or (q["source"] == "NSE stream" and q.get("volume")):
             traded.add(t)
         if t in traded:   # NSE confirmed a trade today: skips holidays and stocks not traded yet
@@ -676,12 +719,25 @@ def run(until, send, opening=True, stop=None):
             feed.save(day)
             flow.save(day)
             last_save = time.time()
+        if latest and time.time() - last_pub >= LIVE_PUBLISH_SECONDS:
+            last_pub = time.time()
+            try:
+                from . import publish
+                publish.put("live", live_doc(flow, latest, notes, market, now))
+            except Exception as e:
+                print("live publish failed:", e)
         time.sleep(0.5)
 
     stop.set()
     th.join(timeout=15)
     feed.save(day)
     flow.save(day)
+    if latest:   # leave the closing snapshot up after the session
+        try:
+            from . import publish
+            publish.put("live", live_doc(flow, latest, notes, market))
+        except Exception:
+            pass
     os.makedirs(OUT, exist_ok=True)
     with open(f"{OUT}/stream_samples_{day}.jsonl", "w") as f:
         for s in stats["samples"]:

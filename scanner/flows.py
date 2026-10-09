@@ -64,8 +64,11 @@ def option_chain(nse):
     ce = {r["strikePrice"]: (r.get("CE") or {}).get("openInterest") or 0 for r in rows}
     pe = {r["strikePrice"]: (r.get("PE") or {}).get("openInterest") or 0 for r in rows}
     tot_ce, tot_pe = sum(ce.values()), sum(pe.values())
-    return {"expiry": exp, "spot": j.get("underlyingValue"), "pcr": tot_pe / tot_ce if tot_ce else None,
-            "call_wall": max(ce, key=ce.get) if ce else None, "put_wall": max(pe, key=pe.get) if pe else None}
+    spot = j.get("underlyingValue") or 0
+    near = sorted(ce, key=lambda k: abs(k - spot))[:16]
+    return {"expiry": exp, "spot": spot, "pcr": tot_pe / tot_ce if tot_ce else None,
+            "call_wall": max(ce, key=ce.get) if ce else None, "put_wall": max(pe, key=pe.get) if pe else None,
+            "strikes": [{"strike": k, "calls": ce[k], "puts": pe.get(k, 0)} for k in sorted(near)]}
 
 
 def nifty_close(nse):
@@ -135,3 +138,43 @@ def report(nse, day, esc):
         pass
     lines += ["", "<i>Source: NSE end-of-day reports. FII and DII cash figures are provisional.</i>"]
     return {"text": "\n".join(lines)}
+
+
+def data(nse, day):
+    """The same report as structured data, for the website and the bot (published as /api/data/flows)."""
+    out = {"date": day.strftime("%Y-%m-%d"), "nifty": None, "fii": None, "dii": None, "futures": [], "fii_options": None,
+           "options": None}
+    try:
+        last, chg, when = nifty_close(nse)
+        if when and datetime.strptime(when[:11], "%d-%b-%Y").date() == day.date():   # only that day's close
+            out["nifty"] = {"last": last, "chg": chg}
+    except Exception:
+        pass
+    try:
+        f = fii_dii(nse)
+        for k in ("FII", "DII"):
+            if k in f:
+                d = datetime.strptime(f[k]["date"], "%d-%b-%Y").strftime("%Y-%m-%d")
+                out[k.lower()] = {**f[k], "date": d}
+    except Exception:
+        pass
+    oi = participant_oi(nse, day)
+    if oi:
+        pday, prev = previous_oi(nse, day)
+        for g, label in (("FII", "Foreign investors"), ("DII", "Indian institutions"), ("Pro", "Professional traders"),
+                         ("Client", "Retail and others")):
+            now = long_share(oi.get(g, {}))
+            if now is not None:
+                was = long_share(prev.get(g, {})) if prev else None
+                out["futures"].append({"group": g, "label": label, "long_pct": round(now, 1),
+                                       "prev_pct": round(was, 1) if was is not None else None,
+                                       "prev_date": pday.strftime("%Y-%m-%d") if pday else None})
+        fii = oi.get("FII", {})
+        out["fii_options"] = {"net_calls": fii.get("Option Index Call Long", 0) - fii.get("Option Index Call Short", 0),
+                              "net_puts": fii.get("Option Index Put Long", 0) - fii.get("Option Index Put Short", 0)}
+        out["oi_date"] = day.strftime("%Y-%m-%d")
+    try:
+        out["options"] = option_chain(nse)
+    except Exception:
+        pass
+    return out
