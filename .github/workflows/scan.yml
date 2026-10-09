@@ -16,6 +16,9 @@ on:
       until:
         description: "session end time IST (HH:MM)"
         default: "15:40"
+      opening:
+        description: "send the morning brief and overnight digest (yes/no)"
+        default: "no"
 
 concurrency:
   group: scanner-${{ github.event.schedule || github.event.inputs.mode }}
@@ -53,7 +56,11 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           if [ "${{ github.event.inputs.mode }}" = "session" ]; then
-            python -m scanner.run --until "${{ github.event.inputs.until }}"
+            if [ "${{ github.event.inputs.opening }}" = "yes" ]; then
+              python -m scanner.run --until "${{ github.event.inputs.until }}"
+            else
+              python -m scanner.run --until "${{ github.event.inputs.until }}" --no-opening
+            fi
           elif [ "${{ github.event.inputs.mode }}" = "evening" ]; then
             python -m scanner.run --evening
           else

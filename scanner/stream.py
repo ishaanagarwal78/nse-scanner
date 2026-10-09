@@ -331,8 +331,9 @@ def parse_book(ob):
     bids, asks, tb, ts = [], [], None, None
     if isinstance(ob, dict):
         for i in range(1, 6):
-            bp, bq = ob.get(f"buyPrice{i}"), ob.get(f"buyQuantity{i}")
-            sp, sq = ob.get(f"sellPrice{i}"), ob.get(f"sellQuantity{i}")
+            # quote API: buyPrice1/buyQuantity1; push stream: buyOrderPrice1/buyOrderQty1
+            bp, bq = ob.get(f"buyPrice{i}") or ob.get(f"buyOrderPrice{i}"), ob.get(f"buyQuantity{i}") or ob.get(f"buyOrderQty{i}")
+            sp, sq = ob.get(f"sellPrice{i}") or ob.get(f"sellOrderPrice{i}"), ob.get(f"sellQuantity{i}") or ob.get(f"sellOrderQty{i}")
             if bp:
                 bids.append((float(bp), float(bq or 0)))
             if sp:
@@ -345,7 +346,8 @@ def parse_book(ob):
             for x in ob.get(k) or []:
                 if isinstance(x, dict) and x.get("price"):
                     asks.append((float(x["price"]), float(x.get("quantity") or x.get("qty") or 0)))
-        tb, ts = ob.get("totalBuyQuantity") or ob.get("totBuyQty"), ob.get("totalSellQuantity") or ob.get("totSellQty")
+        tb = ob.get("totalBuyQuantity") or ob.get("totalBuyQty") or ob.get("totBuyQty")
+        ts = ob.get("totalSellQuantity") or ob.get("totalSellQty") or ob.get("totSellQty")
     elif isinstance(ob, list):
         for x in ob:
             if isinstance(x, dict) and x.get("price"):
@@ -510,6 +512,9 @@ def run(until, send, opening=True, stop=None):
     day = today.isoformat()
     feed, flow = Feed(), Flow()
     unlocks, watchers, people, every = targets(today)
+    extra = {x.strip().upper() + ".NS" for x in os.environ.get("STREAM_TEST_SYMBOLS", "").split(",") if x.strip()}
+    for t in extra:   # test only: follow these stocks as if watched, alerts go nowhere
+        watchers.setdefault(t, [])
     focus = sorted(set(unlocks) | set(watchers))
     stream_list = sorted(set(every) | set(focus) | {"^NSEI"})
     print(f"live feed: {len(focus)} stocks on alert watch ({len(unlocks)} in unlock week), "
