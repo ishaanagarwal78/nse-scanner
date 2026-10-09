@@ -32,38 +32,41 @@
   .panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; }
   .scroll { max-height: calc(100vh - 120px); overflow: auto; }
   table { width: 100%; border-collapse: collapse; }
-  th { position: sticky; top: 0; background: var(--panel); text-align: right; font-weight: 600; color: var(--muted);
+  th { position: sticky; top: 0; z-index: 2; background: var(--panel); text-align: right; font-weight: 600; color: var(--muted);
        font-size: 12px; padding: 9px 10px; border-bottom: 1px solid var(--rule); cursor: pointer; white-space: nowrap; }
+  th.on { color: var(--ink); }
   th:first-child, td:first-child { text-align: left; }
   td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
-  tr.row { cursor: pointer; }
+  tr.row { cursor: pointer; position: relative; background: var(--panel); transition: background-color .2s; }
   tr.row:hover, tr.row.sel { background: var(--sel); }
   .sym { font-weight: 600; }
   .note { display: block; color: var(--muted); font-size: 12px; }
   .up { color: var(--up); } .down { color: var(--down); }
-  .flash-up { animation: fu 0.9s ease-out; } .flash-down { animation: fd 0.9s ease-out; }
-  @keyframes fu { from { background: var(--up-soft); } to { background: transparent; } }
-  @keyframes fd { from { background: var(--down-soft); } to { background: transparent; } }
-  @media (prefers-reduced-motion: reduce) { .flash-up, .flash-down { animation: none; } }
+  .chg, .px { transition: color .4s; }
+  .px span { padding: 1px 5px; border-radius: 4px; }
   .split { display: inline-flex; width: 56px; height: 8px; border-radius: 4px; overflow: hidden; background: var(--rule);
            vertical-align: middle; margin-right: 6px; }
-  .split i { display: block; height: 100%; }
+  .split i { display: block; height: 100%; transition: width .7s cubic-bezier(.2,.7,.2,1); }
+  .split .b { background: var(--up); } .split .s { background: var(--down); }
   .stale { color: var(--muted); }
-  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: var(--muted);
+         transition: background-color .4s; }
   .dot.on { background: var(--up); }
   .detail { padding: 16px 18px 18px; }
-  .big { font-size: 30px; font-weight: 650; margin: 2px 0 0; }
+  .big { font-size: 30px; font-weight: 650; margin: 2px 0 0; display: inline-block; padding: 0 6px; margin-left: -6px; border-radius: 6px; }
   h2 { font-size: 16px; margin: 0; }
   h3 { font-size: 13px; margin: 18px 0 6px; color: var(--muted); font-weight: 600; }
   canvas { width: 100%; display: block; }
   .book { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; font-size: 13px; }
   .lvl { position: relative; display: flex; justify-content: space-between; padding: 3px 6px; }
   .lvl span { position: relative; }
-  .lvl i { position: absolute; top: 1px; bottom: 1px; border-radius: 3px; }
+  .lvl i { position: absolute; top: 1px; bottom: 1px; border-radius: 3px; width: 0;
+           transition: width .5s cubic-bezier(.2,.7,.2,1); }
   .bid i { right: 0; background: var(--up-soft); } .ask i { left: 0; background: var(--down-soft); }
   .waiting { margin-top: 8px; color: var(--muted); font-size: 13px; }
   .empty { padding: 40px 18px; color: var(--muted); }
   .rm { border: none; background: none; color: var(--muted); padding: 0 4px; cursor: pointer; font-size: 15px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
@@ -76,10 +79,10 @@
   <form id="add"><input id="sym" placeholder="Add a stock" aria-label="NSE symbol" autocomplete="off"><button>Add</button></form>
 </header>
 <main>
-  <section class="panel scroll">
+  <section class="panel scroll" id="tablewrap">
     <table>
       <thead><tr>
-        <th data-k="symbol">Stock</th><th data-k="price">Price</th><th data-k="chg">Change</th>
+        <th data-k="symbol">Stock</th><th data-k="price">Price</th><th data-k="chg" class="on">Change</th>
         <th data-k="volume">Volume</th><th data-k="press">Buyers, 15 min</th>
         <th data-k="wait" title="Shares waiting to sell divided by shares waiting to buy">Sell ÷ buy</th><th data-k="age">Updated</th><th></th>
       </tr></thead>
@@ -92,125 +95,247 @@
 const $ = (id) => document.getElementById(id);
 const fmt = (x, d = 2) => x == null ? "–" : Number(x).toLocaleString("en-IN", { minimumFractionDigits: d, maximumFractionDigits: d });
 const big = (x) => x == null ? "–" : x >= 1e7 ? (x / 1e7).toFixed(2) + " cr" : x >= 1e5 ? (x / 1e5).toFixed(2) + " L" : fmt(x, 0);
+const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 let sel = new URLSearchParams(location.search).get("s") || "";
-let sortK = "chg", sortDir = 1, es = null, lastPrice = {};
+let sortK = "chg", sortDir = 1, es = null, order = [];
+const rowEls = new Map();           // symbol -> { tr, cells, price }
+
+// ---------- small helpers: set only what changed, soft highlight, number tweens ----------
+function setText(el, v) { if (el.textContent !== v) el.textContent = v; }
+function setHTML(el, v) { if (el._h !== v) { el.innerHTML = v; el._h = v; } }
+function glow(el, up) {
+  if (calm || !el.animate) return;
+  el.animate([{ backgroundColor: css(up ? "--up-soft" : "--down-soft") }, { backgroundColor: "transparent" }],
+             { duration: 1400, easing: "cubic-bezier(.2,.7,.2,1)" });
+}
+function tween(el, to, render, ms = 450) {
+  const from = el._v ?? to;
+  el._v = to;
+  if (calm || from === to) { setText(el, render(to)); return; }
+  const t0 = performance.now();
+  cancelAnimationFrame(el._raf);
+  const step = (t) => {
+    const k = Math.min(1, (t - t0) / ms), e = 1 - Math.pow(1 - k, 3);
+    setText(el, render(from + (to - from) * e));
+    if (k < 1) el._raf = requestAnimationFrame(step);
+  };
+  el._raf = requestAnimationFrame(step);
+}
 
 function connect() {
   if (es) es.close();
   es = new EventSource("/events?sel=" + encodeURIComponent(sel));
   es.onmessage = (e) => render(JSON.parse(e.data));
 }
+const pressure = (r) => { const t = (r.buy15 || 0) + (r.sell15 || 0); return t ? r.buy15 / t : null; };
 
-function pressure(r) {
-  const t = (r.buy15 || 0) + (r.sell15 || 0);
-  return t ? (r.buy15 / t) : null;
+// ---------- the table: rows are built once, then only their cells change ----------
+function makeRow(sym) {
+  const tr = document.createElement("tr");
+  tr.className = "row"; tr.tabIndex = 0; tr.dataset.s = sym;
+  tr.innerHTML = `<td><span class="dot"></span><span class="sym">${sym}</span><span class="note"></span></td>
+    <td class="px"><span></span></td><td class="chg"></td><td class="vol"></td>
+    <td class="pr"><span class="split"><i class="b" style="width:0"></i><i class="s" style="width:0"></i></span><span class="pt"></span></td>
+    <td class="wt"></td><td class="age"></td><td><button class="rm" title="Stop following" data-rm="${sym}">×</button></td>`;
+  const q = (s) => tr.querySelector(s);
+  const o = { tr, dot: q(".dot"), note: q(".note"), px: q(".px span"), chg: q(".chg"), vol: q(".vol"),
+              b: q(".split .b"), s: q(".split .s"), split: q(".split"), pt: q(".pt"), wt: q(".wt"), age: q(".age"), price: null };
+  rowEls.set(sym, o);
+  return o;
+}
+
+function updateRow(o, r) {
+  o.dot.classList.toggle("on", !!r.live);
+  setText(o.note, r.info || "added by you");
+  if (r.price != null && o.price != null && r.price !== o.price) glow(o.px, r.price > o.price);
+  o.price = r.price;
+  setText(o.px, fmt(r.price));
+  setText(o.chg, r.chg == null ? "–" : (r.chg >= 0 ? "+" : "") + r.chg.toFixed(2) + "%");
+  o.chg.classList.toggle("up", r.chg != null && r.chg >= 0);
+  o.chg.classList.toggle("down", r.chg != null && r.chg < 0);
+  setText(o.vol, big(r.volume));
+  const p = pressure(r);
+  o.split.style.visibility = p == null ? "hidden" : "visible";
+  if (p != null) { o.b.style.width = (p * 100).toFixed(1) + "%"; o.s.style.width = (100 - p * 100).toFixed(1) + "%"; }
+  setText(o.pt, p == null ? "no trades yet" : (p * 100).toFixed(0) + "%");
+  o.pt.classList.toggle("stale", p == null);
+  const w = r.waitBuy ? r.waitSell / r.waitBuy : null;
+  setText(o.wt, w == null ? "–" : w.toFixed(2) + "×");
+  o.wt.classList.toggle("down", w != null && w >= 1.5);
+  o.wt.classList.toggle("up", w != null && w <= 0.67);
+  setText(o.age, r.age == null ? "waiting" : r.age < 2 ? "now" : Math.round(r.age) + " s ago");
+  o.age.classList.toggle("stale", r.age == null || r.age > 30);
+  o.tr.classList.toggle("sel", r.symbol === sel);
+}
+
+function sortValue(r) {
+  return sortK === "press" ? pressure(r) : sortK === "wait" ? (r.waitBuy ? r.waitSell / r.waitBuy : null) : r[sortK];
 }
 
 function render(d) {
-  $("clock").textContent = d.clock;
-  $("conn").textContent = `${d.connected} of ${d.following}`;
-  $("delay").textContent = d.delay == null ? "–" : d.delay + " s";
-  $("msgs").textContent = d.messages.toLocaleString("en-IN");
-  const key = (r) => sortK === "press" ? pressure(r) : sortK === "wait" ? (r.waitBuy ? r.waitSell / r.waitBuy : null) : r[sortK];
-  const rows = [...d.rows].sort((a, b) => {
-    const x = key(a), y = key(b);
+  setText($("clock"), d.clock);
+  setText($("conn"), `${d.connected} of ${d.following}`);
+  setText($("delay"), d.delay == null ? "–" : d.delay + " s");
+  setText($("msgs"), d.messages.toLocaleString("en-IN"));
+  const body = $("rows"), seen = new Set();
+  for (const r of d.rows) { seen.add(r.symbol); updateRow(rowEls.get(r.symbol) || makeRow(r.symbol), r); }
+  for (const [sym, o] of rowEls) if (!seen.has(sym)) { o.tr.remove(); rowEls.delete(sym); }
+
+  const next = [...d.rows].sort((a, b) => {
+    const x = sortValue(a), y = sortValue(b);
+    if (x == null && y == null) return a.symbol < b.symbol ? -1 : 1;
     if (x == null) return 1; if (y == null) return -1;
-    return (x > y ? 1 : x < y ? -1 : 0) * (typeof x === "string" ? sortDir : -sortDir);
-  });
-  $("rows").innerHTML = rows.map((r) => {
-    const p = pressure(r), w = r.waitBuy ? r.waitSell / r.waitBuy : null;
-    const cls = r.chg == null ? "" : r.chg >= 0 ? "up" : "down";
-    const moved = lastPrice[r.symbol] != null && r.price != null && r.price !== lastPrice[r.symbol];
-    const flash = moved ? (r.price > lastPrice[r.symbol] ? "flash-up" : "flash-down") : "";
-    return `<tr class="row ${r.symbol === sel ? "sel" : ""}" data-s="${r.symbol}" tabindex="0">
-      <td><span class="dot ${r.live ? "on" : ""}"></span><span class="sym">${r.symbol}</span><span class="note">${r.info || "added by you"}</span></td>
-      <td class="${flash}">${fmt(r.price)}</td>
-      <td class="${cls}">${r.chg == null ? "–" : (r.chg >= 0 ? "+" : "") + r.chg.toFixed(2) + "%"}</td>
-      <td>${big(r.volume)}</td>
-      <td>${p == null ? '<span class="stale">no trades yet</span>' :
-        `<span class="split"><i style="width:${(p * 100).toFixed(0)}%;background:var(--up)"></i><i style="width:${(100 - p * 100).toFixed(0)}%;background:var(--down)"></i></span>${(p * 100).toFixed(0)}%`}</td>
-      <td class="${w == null ? "" : w >= 1.5 ? "down" : w <= 0.67 ? "up" : ""}">${w == null ? "–" : w.toFixed(2) + "×"}</td>
-      <td class="${r.age > 30 ? "stale" : ""}">${r.age == null ? "waiting" : r.age < 2 ? "now" : Math.round(r.age) + " s ago"}</td>
-      <td><button class="rm" title="Stop following" data-rm="${r.symbol}">×</button></td></tr>`;
-  }).join("");
-  d.rows.forEach((r) => (lastPrice[r.symbol] = r.price));
+    return (x > y ? 1 : x < y ? -1 : (a.symbol < b.symbol ? -1 : 1)) * (typeof x === "string" ? sortDir : -sortDir);
+  }).map((r) => r.symbol);
+  if (next.join() !== order.join()) reorder(body, next);
   if (d.detail) renderDetail(d.detail, d.rows.find((r) => r.symbol === sel));
 }
 
-function renderDetail(x, r) {
-  const el = $("detail");
-  if (!el.querySelector("#price")) {
-    el.innerHTML = `<div class="detail">
-      <h2 id="dname"></h2><span class="note" id="dinfo"></span>
-      <div class="big" id="price"></div><div id="dchg"></div>
-      <h3>Price since this screen opened</h3><canvas id="line" height="150"></canvas>
-      <h3>Order book: 5 best buyers and sellers</h3><div class="book" id="book"></div><div class="waiting" id="waiting"></div>
-      <h3>Shares traded each minute: buyers paying up (above) vs sellers selling down (below)</h3><canvas id="flow" height="150"></canvas>
-    </div>`;
+// Rows glide to their new places instead of jumping (FLIP: measure, move, animate the difference)
+function reorder(body, next) {
+  const before = new Map();
+  for (const sym of next) { const o = rowEls.get(sym); if (o && o.tr.isConnected) before.set(sym, o.tr.getBoundingClientRect().top); }
+  const frag = document.createDocumentFragment();
+  for (const sym of next) frag.appendChild(rowEls.get(sym).tr);
+  body.appendChild(frag);
+  order = next;
+  if (calm) return;
+  for (const sym of next) {
+    const tr = rowEls.get(sym).tr, old = before.get(sym);
+    if (old == null) { tr.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 400 }); continue; }
+    const dy = old - tr.getBoundingClientRect().top;
+    if (Math.abs(dy) > 1) tr.animate([{ transform: `translateY(${dy}px)` }, { transform: "none" }],
+                                     { duration: 550, easing: "cubic-bezier(.2,.7,.2,1)" });
   }
-  $("dname").textContent = x.symbol;
-  $("dinfo").textContent = x.info || "added by you";
-  $("price").textContent = r && r.price != null ? "₹" + fmt(r.price) : "waiting for the first update";
-  $("dchg").innerHTML = r && r.chg != null ? `<span class="${r.chg >= 0 ? "up" : "down"}">${(r.chg >= 0 ? "+" : "") + r.chg.toFixed(2)}% today</span>
-    <span class="stat"> · NSE time ${r.nse_time || "–"} · ${r.updates} updates</span>` : "";
+}
+
+// ---------- the detail panel: built once per stock, values and bars animate ----------
+let D = null;    // detail elements and chart state for the selected stock
+function buildDetail(sym) {
+  const el = $("detail");
+  el.innerHTML = `<div class="detail">
+    <h2 id="dname"></h2><span class="note" id="dinfo"></span>
+    <div class="big" id="price">waiting for the first update</div><div id="dchg"></div>
+    <h3>Price since this screen opened</h3><canvas id="line" height="150"></canvas>
+    <h3>Order book: 5 best buyers and sellers</h3>
+    <div class="book" id="book"><div class="stat">Buyers: price, shares</div><div class="stat">Sellers: price, shares</div></div>
+    <div class="waiting" id="waiting"></div>
+    <h3>Shares traded each minute: buyers paying up (above) vs sellers selling down (below)</h3><canvas id="flow" height="150"></canvas>
+  </div>`;
+  const book = $("book"), lv = { bid: [], ask: [] };
+  for (let i = 0; i < 5; i++) for (const side of ["bid", "ask"]) {
+    const d = document.createElement("div");
+    d.className = "lvl " + side;
+    d.innerHTML = `<i></i><span class="p">–</span><span class="q">–</span>`;
+    book.appendChild(d);
+    lv[side].push({ bar: d.querySelector("i"), p: d.querySelector(".p"), q: d.querySelector(".q") });
+  }
+  D = { sym, lv, price: null, line: { ticks: [], lo: null, hi: null, t0: null, t1: null },
+        flow: { target: [], shown: [], mx: 1 } };
+  setText($("dname"), sym);
+}
+
+function renderDetail(x, r) {
+  if (!D || D.sym !== x.symbol) buildDetail(x.symbol);
+  setText($("dinfo"), x.info || "added by you");
+  if (r && r.price != null) {
+    const pe = $("price");
+    if (D.price != null && r.price !== D.price) glow(pe, r.price > D.price);
+    D.price = r.price;
+    tween(pe, r.price, (v) => "₹" + fmt(v));
+    setHTML($("dchg"), r.chg == null ? "" : `<span class="${r.chg >= 0 ? "up" : "down"}">${(r.chg >= 0 ? "+" : "") + r.chg.toFixed(2)}% today</span>
+      <span class="stat"> · NSE time ${r.nse_time || "–"} · ${r.updates} updates</span>`);
+  }
   const dp = x.depth || { bids: [], asks: [] };
   const mx = Math.max(1, ...dp.bids.map((b) => b[1]), ...dp.asks.map((a) => a[1]));
-  const lv = (side, l) => l ? `<div class="lvl ${side}"><i style="width:${(100 * l[1] / mx).toFixed(0)}%"></i><span>${fmt(l[0])}</span><span>${fmt(l[1], 0)}</span></div>` : `<div class="lvl"><span class="stale">–</span></div>`;
-  let h = `<div class="stat">Buyers: price, shares</div><div class="stat">Sellers: price, shares</div>`;
-  for (let i = 0; i < 5; i++) h += lv("bid", dp.bids[i]) + lv("ask", dp.asks[i]);
-  $("book").innerHTML = h;
-  $("waiting").textContent = dp.tot_buy ? `All waiting orders: ${big(dp.tot_buy)} shares to buy, ${big(dp.tot_sell)} to sell.` : "";
-  drawLine($("line"), x.ticks);
-  drawFlow($("flow"), x.minutes);
-}
-
-function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
-function prep(c) {
-  const r = devicePixelRatio || 1, w = c.clientWidth, h = c.height;
-  if (c.width !== w * r) { c.width = w * r; c.style.height = h + "px"; c.dataset.h = h; }
-  const g = c.getContext("2d"); g.setTransform(r, 0, 0, r, 0, 0); const H = +c.dataset.h || h;
-  g.clearRect(0, 0, w, H); return [g, w, H];
-}
-function drawLine(c, ticks) {
-  const [g, w, h] = prep(c);
-  if (!ticks || ticks.length < 2) { g.fillStyle = css("--muted"); g.fillText("Collecting prices…", 8, 20); return; }
-  const ps = ticks.map((t) => t[1]), lo = Math.min(...ps), hi = Math.max(...ps), t0 = ticks[0][0], t1 = ticks[ticks.length - 1][0];
-  const pad = (hi - lo) * 0.1 || hi * 0.001, L = 58;
-  const y = (p) => 8 + (h - 22) * (1 - (p - lo + pad) / (hi - lo + 2 * pad));
-  const x = (t) => L + (w - L - 8) * ((t - t0) / Math.max(1, t1 - t0));
-  g.strokeStyle = css("--rule"); g.fillStyle = css("--muted"); g.font = "11px Segoe UI, sans-serif"; g.lineWidth = 1;
-  [hi, (hi + lo) / 2, lo].forEach((p) => { g.beginPath(); g.moveTo(L, y(p)); g.lineTo(w - 8, y(p)); g.stroke(); g.fillText(fmt(p), 4, y(p) + 4); });
-  g.fillText(new Date(t0 * 1000).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }), L, h - 2);
-  g.strokeStyle = ps[ps.length - 1] >= ps[0] ? css("--up") : css("--down"); g.lineWidth = 2; g.beginPath();
-  ticks.forEach((t, i) => (i ? g.lineTo(x(t[0]), y(t[1])) : g.moveTo(x(t[0]), y(t[1])))); g.stroke();
-}
-function drawFlow(c, mins) {
-  const [g, w, h] = prep(c);
-  const mx = Math.max(1, ...mins.map((m) => Math.max(m.buy, m.sell))), mid = (h - 16) / 2, bw = (w - 60) / mins.length;
-  g.fillStyle = css("--muted"); g.font = "11px Segoe UI, sans-serif";
-  g.fillText(big(mx), 4, 12); g.fillText(big(mx), 4, h - 18);
-  g.strokeStyle = css("--rule"); g.beginPath(); g.moveTo(56, mid); g.lineTo(w, mid); g.stroke();
-  mins.forEach((m, i) => {
-    const x0 = 58 + i * bw;
-    g.fillStyle = css("--up"); g.fillRect(x0, mid - (mid - 4) * m.buy / mx, Math.max(1, bw - 2), (mid - 4) * m.buy / mx);
-    g.fillStyle = css("--down"); g.fillRect(x0, mid, Math.max(1, bw - 2), (mid - 4) * m.sell / mx);
+  for (const [side, levels] of [["bid", dp.bids], ["ask", dp.asks]]) D.lv[side].forEach((o, i) => {
+    const l = levels[i];
+    o.bar.style.width = l ? (100 * l[1] / mx).toFixed(1) + "%" : "0%";
+    setText(o.p, l ? fmt(l[0]) : "–");
+    if (l) tween(o.q, l[1], (v) => fmt(Math.round(v), 0), 400); else { o.q._v = null; setText(o.q, "–"); }
   });
-  g.fillStyle = css("--muted"); g.fillText(mins[0].t, 58, h - 2); g.fillText(mins[mins.length - 1].t, w - 34, h - 2);
+  setText($("waiting"), dp.tot_buy ? `All waiting orders: ${big(dp.tot_buy)} shares to buy, ${big(dp.tot_sell)} to sell.` : "");
+  D.line.ticks = x.ticks || [];
+  D.flow.target = x.minutes || [];
 }
 
+// Charts redraw every frame, easing their scale and bar heights toward the latest data
+function prep(c) {
+  const r = devicePixelRatio || 1, w = c.clientWidth, h = +c.getAttribute("height");
+  if (c.width !== Math.round(w * r)) { c.width = Math.round(w * r); c.height = Math.round(h * r); c.style.height = h + "px"; }
+  const g = c.getContext("2d"); g.setTransform(r, 0, 0, r, 0, 0); g.clearRect(0, 0, w, h); return [g, w, h];
+}
+const ease = (a, b, k) => a == null ? b : a + (b - a) * k;
+
+function drawLine(c, L) {
+  const [g, w, h] = prep(c), ticks = L.ticks;
+  g.font = "11px Segoe UI, sans-serif";
+  if (ticks.length < 2) { g.fillStyle = css("--muted"); g.fillText("Collecting prices…", 8, 20); return; }
+  const ps = ticks.map((t) => t[1]); let lo = Math.min(...ps), hi = Math.max(...ps);
+  const pad = (hi - lo) * 0.12 || hi * 0.001; lo -= pad; hi += pad;
+  const k = calm ? 1 : 0.12;
+  L.lo = ease(L.lo, lo, k); L.hi = ease(L.hi, hi, k);
+  L.t0 = ease(L.t0, ticks[0][0], k); L.t1 = ease(L.t1, ticks[ticks.length - 1][0], k);
+  const left = 58, y = (p) => 8 + (h - 22) * (1 - (p - L.lo) / (L.hi - L.lo || 1));
+  const x = (t) => left + (w - left - 10) * ((t - L.t0) / Math.max(1, L.t1 - L.t0));
+  g.strokeStyle = css("--rule"); g.fillStyle = css("--muted"); g.lineWidth = 1;
+  [L.hi - pad * 0.5, (L.hi + L.lo) / 2, L.lo + pad * 0.5].forEach((p) => {
+    g.beginPath(); g.moveTo(left, y(p)); g.lineTo(w - 10, y(p)); g.stroke(); g.fillText(fmt(p), 4, y(p) + 4);
+  });
+  g.fillText(new Date(ticks[0][0] * 1000).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }), left, h - 2);
+  const col = ps[ps.length - 1] >= ps[0] ? css("--up") : css("--down");
+  g.save(); g.beginPath(); g.rect(left, 0, w - left - 9, h); g.clip();
+  g.strokeStyle = col; g.lineWidth = 2; g.lineJoin = "round"; g.beginPath();
+  ticks.forEach((t, i) => (i ? g.lineTo(x(t[0]), y(t[1])) : g.moveTo(x(t[0]), y(t[1])))); g.stroke();
+  const last = ticks[ticks.length - 1], pulse = calm ? 0 : (Math.sin(performance.now() / 300) + 1) / 2;
+  g.fillStyle = col; g.globalAlpha = 0.18 + 0.12 * pulse;
+  g.beginPath(); g.arc(x(last[0]), y(last[1]), 5 + 2 * pulse, 0, 7); g.fill();
+  g.globalAlpha = 1; g.beginPath(); g.arc(x(last[0]), y(last[1]), 3, 0, 7); g.fill(); g.restore();
+}
+
+function drawFlow(c, F) {
+  const [g, w, h] = prep(c), T = F.target;
+  if (!T.length) return;
+  const k = calm ? 1 : 0.15;
+  if (F.shown.length !== T.length || F.shown[F.shown.length - 1]?.t !== T[T.length - 1].t)
+    F.shown = T.map((m) => { const o = F.shown.find((s) => s.t === m.t); return o ? o : { t: m.t, buy: 0, sell: 0 }; });
+  F.shown.forEach((s, i) => { s.buy = ease(s.buy, T[i].buy, k); s.sell = ease(s.sell, T[i].sell, k); });
+  F.mx = ease(F.mx, Math.max(1, ...T.map((m) => Math.max(m.buy, m.sell))), k);
+  const mid = (h - 16) / 2, bw = (w - 60) / F.shown.length;
+  g.fillStyle = css("--muted"); g.font = "11px Segoe UI, sans-serif";
+  g.fillText(big(F.mx), 4, 12); g.fillText(big(F.mx), 4, h - 18);
+  g.strokeStyle = css("--rule"); g.beginPath(); g.moveTo(56, mid); g.lineTo(w, mid); g.stroke();
+  F.shown.forEach((m, i) => {
+    const x0 = 58 + i * bw, bh = (mid - 4) * m.buy / F.mx, sh = (mid - 4) * m.sell / F.mx;
+    g.fillStyle = css("--up"); g.fillRect(x0, mid - bh, Math.max(1, bw - 2), bh);
+    g.fillStyle = css("--down"); g.fillRect(x0, mid, Math.max(1, bw - 2), sh);
+  });
+  g.fillStyle = css("--muted"); g.fillText(T[0].t, 58, h - 2); g.fillText(T[T.length - 1].t, w - 34, h - 2);
+}
+
+(function frame() {
+  if (D) { const l = $("line"), f = $("flow"); if (l) drawLine(l, D.line); if (f) drawFlow(f, D.flow); }
+  requestAnimationFrame(frame);
+})();
+
+// ---------- interaction ----------
 $("rows").addEventListener("click", (e) => {
   const rm = e.target.closest("[data-rm]");
-  if (rm) { fetch("/remove?s=" + rm.dataset.rm); if (rm.dataset.rm === sel) sel = ""; return; }
-  const tr = e.target.closest("tr.row"); if (!tr) return;
-  sel = tr.dataset.s; history.replaceState(null, "", "?s=" + sel); $("detail").innerHTML = ""; connect();
+  if (rm) { fetch("/remove?s=" + rm.dataset.rm); if (rm.dataset.rm === sel) { sel = ""; D = null; } return; }
+  const tr = e.target.closest("tr.row"); if (!tr || tr.dataset.s === sel) return;
+  sel = tr.dataset.s; history.replaceState(null, "", "?s=" + sel);
+  for (const [s, o] of rowEls) o.tr.classList.toggle("sel", s === sel);
+  connect();
 });
 $("rows").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.closest("tr.row")?.click(); });
 document.querySelectorAll("th[data-k]").forEach((th) => th.addEventListener("click", () => {
   sortDir = sortK === th.dataset.k ? -sortDir : 1; sortK = th.dataset.k;
+  document.querySelectorAll("th[data-k]").forEach((x) => x.classList.toggle("on", x === th));
 }));
 $("add").addEventListener("submit", async (e) => {
   e.preventDefault(); const s = $("sym").value.trim().toUpperCase(); if (!s) return;
-  await fetch("/add?s=" + encodeURIComponent(s)); $("sym").value = ""; sel = s; $("detail").innerHTML = ""; connect();
+  await fetch("/add?s=" + encodeURIComponent(s)); $("sym").value = ""; sel = s; connect();
 });
 connect();
 </script>

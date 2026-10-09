@@ -151,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
                 while True:
                     self.wfile.write(f"data: {json.dumps(LIVE.snapshot(sel))}\n\n".encode())
                     self.wfile.flush()
-                    time.sleep(1)
+                    time.sleep(0.5)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 return
         self._send(404, '{"error": "not found"}')
