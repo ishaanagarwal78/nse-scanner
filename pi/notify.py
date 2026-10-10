@@ -5,6 +5,8 @@ import subprocess
 import sys
 
 import requests
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import scanner.ipv4  # noqa: E402,F401  every outgoing connection over IPv4 (scanner/ipv4.py)
 
 unit = sys.argv[1] if len(sys.argv) > 1 else "unknown"
 token, owner = os.environ.get("OPS_BOT_TOKEN", ""), os.environ.get("OWNER_CHAT", "")

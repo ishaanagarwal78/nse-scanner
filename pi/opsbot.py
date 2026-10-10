@@ -15,6 +15,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import scanner.ipv4  # noqa: E402,F401  every outgoing connection over IPv4 (scanner/ipv4.py)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 TOKEN = os.environ.get("OPS_BOT_TOKEN", "")
@@ -372,10 +375,20 @@ def handle(chat, data, msg_id=None):
         return show(chat, logs_view(), msg_id)
     if data == "update":
         show(chat, ("⬆️ Updating… this takes up to a minute.", []), msg_id)
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        before = sh("git", "-C", repo, "rev-parse", "HEAD")
         sh("sudo", "systemctl", "start", UNITS["update"], timeout=300)
-        rev = sh("git", "-C", os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "log", "-1", "--format=%h %s")
-        return show(chat, (f"⬆️ Updated to <code>{html.escape(rev)}</code>.\nThe scanner picks it up on its next start "
-                           "(or tap Restart under Scanner).", [[B("⬅️ Menu", "menu")]]), msg_id)
+        rev = sh("git", "-C", repo, "log", "-1", "--format=%h %s")
+        bot_changed = before != sh("git", "-C", repo, "rev-parse", "HEAD") and \
+            sh("git", "-C", repo, "diff", "--name-only", before, "HEAD", "--", "pi/", "scanner/ipv4.py") != ""
+        show(chat, (f"⬆️ Updated to <code>{html.escape(rev)}</code>.\nThe scanner picks it up on its next start "
+                    "(or tap Restart under Scanner)."
+                    + ("\n🔄 This update changes the ops bot itself, so it restarts now; back in about 15 seconds." if bot_changed else ""),
+                    [[B("⬅️ Menu", "menu")]]), msg_id)
+        if bot_changed:
+            time.sleep(1)
+            os._exit(0)   # systemd (Restart=always) starts the bot again with the new code
+        return
     if data == "stress":
         return show(chat, ("🧪 Run all 4 cores at full power for 10 minutes and record the peak temperature? "
                            "Best done outside market hours.", [[B("✅ Run it", "stress:go"), B("⬅️ Menu", "menu")]]), msg_id)

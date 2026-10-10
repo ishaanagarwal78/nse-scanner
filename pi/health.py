@@ -15,6 +15,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import scanner.ipv4  # noqa: E402,F401  every outgoing connection over IPv4 (scanner/ipv4.py)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 TOKEN = os.environ.get("OPS_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
