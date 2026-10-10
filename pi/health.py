@@ -120,6 +120,12 @@ def main(daily=False):
     try:
         requests.get("https://www.google.com/generate_204", timeout=8)
         net_ok = True
+        # outside "Pi is alive" monitor: Honeybadger alerts by email if these check-ins stop
+        if os.environ.get("HONEYBADGER_CHECKIN"):
+            try:
+                requests.get(os.environ["HONEYBADGER_CHECKIN"], timeout=10)
+            except Exception as e:
+                print("honeybadger check-in failed:", e)
     except Exception:
         net_ok = False
     if not net_ok:

@@ -423,6 +423,39 @@ def handle(chat, data, msg_id=None):
     show(chat, ("Use the buttons below.", MENU), msg_id)
 
 
+# settings the owner may change from Telegram with /set NAME value (written to the scanner's .env, chmod 600)
+SETTABLE = {
+    "HONEYBADGER_CHECKIN": ("https://api.honeybadger.io/", "Honeybadger check-in link (outside 'Pi is alive' monitor)"),
+    "SENTRY_DSN": ("https://", "Sentry link for crash reports"),
+}
+
+
+def set_setting(chat, msg_id, text):
+    parts = text.split(None, 2)
+    if len(parts) < 3 or parts[1].upper() not in SETTABLE:
+        names = "\n".join(f"• <code>{k}</code>: {d}" for k, (_, d) in SETTABLE.items())
+        tg("sendMessage", chat_id=chat, parse_mode="HTML", text=f"Use <code>/set NAME value</code>. Names:\n{names}")
+        return
+    name, value = parts[1].upper(), parts[2].strip()
+    prefix = SETTABLE[name][0]
+    tg("deleteMessage", chat_id=chat, message_id=msg_id)   # don't leave the secret in the chat
+    if not value.startswith(prefix) or any(c in value for c in " \n\r'\"`$\\"):
+        tg("sendMessage", chat_id=chat, text=f"⚠️ That doesn't look like a {SETTABLE[name][1]}; nothing saved.")
+        return
+    env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    lines = [l for l in open(env, encoding="utf-8").read().splitlines() if not l.startswith(name + "=")]
+    lines.append(f"{name}={value}")
+    tmp = env + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, env)
+    os.environ[name] = value
+    tg("sendMessage", chat_id=chat, parse_mode="HTML",
+       text=f"✅ Saved <code>{name}</code> (your message was deleted). The health check uses it from its next run, "
+            "within 5 minutes.")
+
+
 def _uptime():
     try:
         return float(open("/proc/uptime").read().split()[0])
@@ -496,7 +529,11 @@ def main():
                 if chat != OWNER:
                     tg("sendMessage", chat_id=chat, text="This bot is private.")
                     continue
-                cmd = (u["message"].get("text") or "").strip().lstrip("/").split("@")[0].split()[0:1]
+                text = (u["message"].get("text") or "").strip()
+                if text.lower().startswith("/set"):
+                    set_setting(chat, u["message"]["message_id"], text)
+                    continue
+                cmd = text.lstrip("/").split("@")[0].split()[0:1]
                 threading.Thread(target=handle, args=(chat, cmd[0].lower() if cmd else "menu"), daemon=True).start()
         if not r.get("ok"):
             time.sleep(10)
