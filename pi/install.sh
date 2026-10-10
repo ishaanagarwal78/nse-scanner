@@ -229,6 +229,8 @@ sudo mkdir -p /etc/systemd/system.conf.d /etc/systemd/journald.conf.d
 printf '[Manager]\nRuntimeWatchdogSec=15\nRebootWatchdogSec=2min\n' | sudo tee /etc/systemd/system.conf.d/watchdog.conf >/dev/null
 printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=40M\n' | sudo tee /etc/systemd/journald.conf.d/ram.conf >/dev/null
 sudo timedatectl set-timezone Asia/Kolkata
+# prefer IPv4 for every program (git, curl, apt); Python code is pinned to IPv4 by scanner/ipv4.py
+grep -q '^precedence ::ffff:0:0/96' /etc/gai.conf 2>/dev/null || echo 'precedence ::ffff:0:0/96  100' | sudo tee -a /etc/gai.conf >/dev/null
 sudo usermod -aG gpio "$USER_NAME" 2>/dev/null || true
 sudo apt-get install -y -q unattended-upgrades >/dev/null
 printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' | sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
