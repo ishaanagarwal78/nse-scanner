@@ -412,8 +412,11 @@ def handle(chat, data, msg_id=None):
                            "reports stop. The website and the main bot keep working.",
                            [[B("✅ Yes, power off", "poweroff:go"), B("⬅️ No", "menu")]]), msg_id)
     if data == "poweroff:go":
+        hb = hb_grace("1 week")
+        hb_note = ("Honeybadger's alarm is paused until the Pi is back (up to a week)." if hb else
+                   "Honeybadger will email once that the Pi went quiet; that's expected." if os.environ.get("HONEYBADGER_CHECKIN") else "")
         show(chat, ("⏻ Shutting down… It's safe to unplug once the green light on the Pi has stopped flashing "
-                    "(about 30 seconds). Plug it back in to start it; I'll message you when it's up.", []), msg_id)
+                    "(about 30 seconds). Plug it back in to start it; I'll message you when it's up.\n" + hb_note, []), msg_id)
         st["powering_off"] = True
         save(st)
         _heartbeat_off()
@@ -426,8 +429,24 @@ def handle(chat, data, msg_id=None):
 # settings the owner may change from Telegram with /set NAME value (written to the scanner's .env, chmod 600)
 SETTABLE = {
     "HONEYBADGER_CHECKIN": ("https://api.honeybadger.io/", "Honeybadger check-in link (outside 'Pi is alive' monitor)"),
+    "HONEYBADGER_API_TOKEN": ("", "Honeybadger personal API token (lets a planned power-off pause the alarm)"),
+    "HONEYBADGER_PROJECT": ("", "Honeybadger project number (from the project's web address)"),
     "SENTRY_DSN": ("https://", "Sentry link for crash reports"),
 }
+
+
+def hb_grace(period):
+    """Change the Honeybadger check-in's grace period (Data API). Used to silence it during a planned power-off
+    ("1 week") and to restore it after boot ("15 minutes"). Returns True if Honeybadger accepted it."""
+    url, tok, proj = (os.environ.get(k, "") for k in ("HONEYBADGER_CHECKIN", "HONEYBADGER_API_TOKEN", "HONEYBADGER_PROJECT"))
+    if not (url and tok and proj):
+        return False
+    try:
+        r = requests.put(f"https://app.honeybadger.io/v2/projects/{proj}/check_ins/{url.rstrip('/').split('/')[-1]}",
+                         auth=(tok, ""), json={"check_in": {"grace_period": period}}, timeout=15)
+        return r.status_code < 300
+    except Exception:
+        return False
 
 
 def set_setting(chat, msg_id, text):
@@ -439,7 +458,8 @@ def set_setting(chat, msg_id, text):
     name, value = parts[1].upper(), parts[2].strip()
     prefix = SETTABLE[name][0]
     tg("deleteMessage", chat_id=chat, message_id=msg_id)   # don't leave the secret in the chat
-    if not value.startswith(prefix) or any(c in value for c in " \n\r'\"`$\\"):
+    if (not value.startswith(prefix) or any(c in value for c in " \n\r'\"`$\\")
+            or (name == "HONEYBADGER_PROJECT" and not value.isdigit())):
         tg("sendMessage", chat_id=chat, text=f"⚠️ That doesn't look like a {SETTABLE[name][1]}; nothing saved.")
         return
     env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -493,6 +513,8 @@ def main():
     booted = _uptime() < 600     # this start is a fresh boot, not just the bot restarting
     planned = "reboot" if st.pop("rebooting", False) else "power-off" if st.pop("powering_off", False) else None
     save(st)
+    if booted or planned == "power-off":
+        hb_grace("15 minutes")   # undo a planned power-off's pause (harmless if it wasn't paused)
     if booted:
         clean = os.path.exists(CLEAN_MARK)
         how = (f"✅ The previous shutdown was clean ({open(CLEAN_MARK).read().strip()[:16].replace('T', ' ')})." if clean else
